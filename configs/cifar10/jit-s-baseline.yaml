@@ -6,6 +6,7 @@ experiment:
   name: jit-s-cifar10-baseline
   model: jit          # jit | vim | vmamba
   dataset: cifar10
+  data_dir: ./data          # path to dataset root
   seed: 42
 
 # ── Architecture ─────────────────────────────────────────────

@@ -121,15 +121,16 @@ def build_model(cfg):
 def build_dataset(cfg):
     dataset  = cfg["experiment"]["dataset"]
     img_size = cfg["model"]["input_size"]
+    data_dir = cfg["experiment"].get("data_dir", "./data")  # configurable path
     norm     = T.Normalize([0.5]*3, [0.5]*3)
     if dataset == "cifar10":
         return torchvision.datasets.CIFAR10(
-            root="./data", train=True, download=True,
+            root=data_dir, train=True, download=True,
             transform=T.Compose([T.RandomHorizontalFlip(), T.ToTensor(), norm]),
         )
     elif dataset == "imagenet":
         return torchvision.datasets.ImageFolder(
-            root="./data/imagenet/train",
+            root=os.path.join(data_dir, "train"),
             transform=T.Compose([
                 T.Resize(img_size), T.CenterCrop(img_size),
                 T.RandomHorizontalFlip(), T.ToTensor(), norm,

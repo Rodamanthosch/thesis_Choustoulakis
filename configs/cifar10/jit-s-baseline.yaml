@@ -1,48 +1,64 @@
-# configs/cifar10/jit-s-baseline.yaml
-# JiT-S baseline on CIFAR-10
+# ============================================================
+# JiT-S (attention) on CIFAR-10 — baseline, no CFG
+# ============================================================
 
 experiment:
   name: jit-s-cifar10-baseline
+  model: jit          # jit | vim | vmamba
   dataset: cifar10
   seed: 42
 
+# ── Architecture ─────────────────────────────────────────────
 model:
-  arch: jit-s
+  input_size: 32
+  patch_size: 2         # → 16×16 = 256 tokens
+  in_channels: 3
+  hidden_size: 384
   depth: 12
-  hidden_dim: 384
-  heads: 6
-  patch_size: 8
-  in_context_tokens: 32
+  num_heads: 6
+  mlp_ratio: 4.0
   bottleneck_dim: 128
-  dropout: 0.0
+  num_classes: 10
+  attn_drop: 0.0
+  proj_drop: 0.0
+  # In-context tokens (attention model only, ignored by vim/vmamba)
+  in_context_len: 0     # 0 = off; set 32 to enable (JiT paper Table 9)
+  in_context_start: 0   # which block to start prepending (paper uses 4)
 
+# ── Training ─────────────────────────────────────────────────
 training:
   epochs: 200
   batch_size: 128
-  lr: 2.0e-4
-  optimizer: adam
+  warmup_epochs: 5
+  blr: 5.0e-5           # base lr — scaled by batch_size/256 automatically
+  optimizer: adamw
   betas: [0.9, 0.95]
   weight_decay: 0.0
-  warmup_epochs: 5
-  ema_decay: 0.9999
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
 
+# ── Diffusion / Flow ─────────────────────────────────────────
 diffusion:
-  prediction: x_pred      # x_pred | eps_pred | v_pred
-  loss: v_loss
-  time_sampler: logit_normal
-  time_mu: -0.8
-  time_sigma: 0.8
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
   noise_scale: 1.0
-  cfg_drop_prob: 0.1
 
+# ── CFG (off by default) ──────────────────────────────────────
+cfg:
+  label_drop_prob: 0.0  # set 0.1 to enable CFG training
+  cfg_scale: 1.0        # set 2.5 at sampling (1.0 = no CFG)
+  cfg_interval: [0.0, 1.0]
+
+# ── Sampling ─────────────────────────────────────────────────
 sampling:
-  ode_solver: heun
-  ode_steps: 50
-  cfg_scale: 2.5
-  cfg_interval: [0.1, 1.0]
-  batch_size: 16
+  method: heun
+  steps: 50
 
-logging:
-  save_every: 10          # epochs
-  sample_every: 10
+# ── Checkpointing ────────────────────────────────────────────
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
   output_dir: experiments/cifar10/jit-s-baseline

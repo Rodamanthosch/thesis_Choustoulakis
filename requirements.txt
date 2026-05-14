@@ -1,15 +1,21 @@
-torch>=2.0.0
-torchvision>=0.15.0
-timm
-einops
-thop
-pyyaml
+# Core
+torch>=2.5.1
+torchvision>=0.20.1
 numpy
 matplotlib
 tqdm
 pillow
-scipy
-clean-fid        # FID evaluation
-wandb            # optional: experiment tracking
-jupyter
-ipykernel
+pyyaml
+
+# Mamba (required for vim and vmamba models)
+# Install prebuilt wheels — see notebooks/cifar10/ for exact install commands
+# mamba-ssm>=2.2.4
+# causal-conv1d>=1.5.0  (required for vim only)
+
+# Evaluation
+pytorch-fid
+torch-fidelity
+torchmetrics[image]
+
+# Profiling
+thop

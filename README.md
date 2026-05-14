@@ -249,6 +249,53 @@ python scripts/run_experiment.py --config configs/cifar10/jit-s-baseline.yaml \
 
 ---
 
+## Evaluation (FID, IS, Complexity)
+
+After training, run the eval script to get FID, IS, MACs, params, and throughput:
+
+```bash
+python scripts/evaluate.py \
+    --config configs/cifar10/jit-s-baseline.yaml \
+    --checkpoint experiments/cifar10/jit-s-baseline/checkpoint-best.pt \
+    --n_samples 10000 \
+    --ema 1
+```
+
+Output:
+```
+── Complexity ──────────────────────────────────────────────
+  Parameters : 32.64 M
+  GFLOPs     : X.XXXX
+  Throughput : XXXX img/s
+
+── FID / IS ────────────────────────────────────────────────
+  FID-10K  : X.XX
+  IS-10K   : X.XX ± X.XX
+
+Results saved → experiments/cifar10/jit-s-baseline/eval/eval_results.json
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--config` | required | Same config used for training |
+| `--checkpoint` | required | Path to `.pt` checkpoint |
+| `--n_samples` | 10000 | Samples for FID/IS — use 50000 for official |
+| `--ema` | 1 | Which EMA copy to use (1 or 2) |
+| `--skip_fid` | false | Only run complexity, skip FID/IS |
+| `--out_dir` | next to checkpoint | Where to save results |
+
+On Kaggle after a 100-epoch run:
+```python
+!pip install -q thop torch-fidelity
+
+!python scripts/evaluate.py \
+    --config configs/cifar10/jit-s-baseline.yaml \
+    --checkpoint /kaggle/working/jit-s-cifar10/checkpoint-best.pt \
+    --n_samples 10000
+```
+
+---
+
 ## All Hyperparameters
 
 | Section | Key | Default | Description |

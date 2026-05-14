@@ -81,13 +81,14 @@ WHEELS = [
     ("https://github.com/state-spaces/mamba/releases/download/v2.2.4/"
      "mamba_ssm-2.2.4+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"),
 ]
-for url in WHEELS:
-    fname = url.split("/")[-1]
-    if not os.path.exists(f"/kaggle/working/{fname}"):
-        os.system(f"wget -q {url}")
+CAUSAL = "causal_conv1d-1.5.0.post8+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+MAMBA  = "mamba_ssm-2.2.4+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
 
-!pip install -q /kaggle/working/causal_conv1d-1.5.0.post8+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
-!pip install -q /kaggle/working/mamba_ssm-2.2.4+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+os.system(f"wget -q https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.0.post8/{CAUSAL} -O /kaggle/working/{CAUSAL}")
+os.system(f"wget -q https://github.com/state-spaces/mamba/releases/download/v2.2.4/{MAMBA} -O /kaggle/working/{MAMBA}")
+
+!pip install -q /kaggle/working/{CAUSAL}
+!pip install -q /kaggle/working/{MAMBA}
 !pip install -q pytorch-fid thop
 
 # 3) Patch mamba-ssm (fixes a removed transformers class)

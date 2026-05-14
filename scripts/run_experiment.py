@@ -28,9 +28,6 @@ from tqdm import tqdm
 # Allow running from repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models.jit import JiT
-from src.models.vim import JiTViM
-from src.models.vmamba import JiTVMamba
 from src.train import Denoiser
 from src.utils import (
     load_config, save_checkpoint, load_checkpoint,
@@ -63,6 +60,7 @@ def build_model(cfg):
     m = cfg["model"]
 
     if arch == "jit":
+        from src.models.jit import JiT
         return JiT(
             input_size    = m["input_size"],
             patch_size    = m["patch_size"],
@@ -79,6 +77,7 @@ def build_model(cfg):
             in_context_start= m.get("in_context_start", 0),
         )
     elif arch == "vim":
+        from src.models.vim import JiTViM
         return JiTViM(
             input_size    = m["input_size"],
             patch_size    = m["patch_size"],
@@ -96,6 +95,7 @@ def build_model(cfg):
             expand        = m.get("expand", 1),
         )
     elif arch == "vmamba":
+        from src.models.vmamba import JiTVMamba
         return JiTVMamba(
             input_size    = m["input_size"],
             patch_size    = m["patch_size"],

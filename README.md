@@ -115,6 +115,44 @@ for path in glob.glob("/usr/local/lib/python*/dist-packages/mamba_ssm/utils/gene
 
 ---
 
+## Quick Start on Kaggle
+
+### Step 1 — Clone the repo
+```python
+!git clone https://github.com/Rodamanthosch/thesis_Choustoulakis.git
+%cd thesis_Choustoulakis
+!pip install -q pyyaml tqdm pytorch-fid
+```
+
+### Step 2 — Smoke test (3 epochs, confirms everything works)
+```python
+!python scripts/run_experiment.py \
+    --config configs/cifar10/jit-s-baseline.yaml \
+    training.epochs=3 \
+    checkpoint.save_last_freq=1 \
+    checkpoint.save_archive_freq=999 \
+    checkpoint.output_dir=/kaggle/working/smoke-test
+```
+
+Expected output:
+```
+Epoch   1/3 | v-loss 2.XXXX  [last]
+Epoch   2/3 | v-loss 2.XXXX  [last]
+Epoch   3/3 | v-loss 2.XXXX  [last]
+✅ Training complete.
+```
+
+### Step 3 — Run a full experiment
+```python
+!python scripts/run_experiment.py \
+    --config configs/cifar10/jit-s-baseline.yaml \
+    checkpoint.output_dir=/kaggle/working/jit-s-cifar10
+```
+
+> **Note:** For ViM and VMamba models, run the Mamba setup cell first (see Setup section above), restart the runtime, then run the experiment.
+
+---
+
 ## Running Experiments
 
 All experiments go through one script:

@@ -1,0 +1,49 @@
+# configs/cifar10/jit-s2-vmamba-baseline.yaml
+# JiT-S2 with VMamba backbone on CIFAR-10
+
+experiment:
+  name: jit-s2-vmamba-cifar10-baseline
+  dataset: cifar10
+  seed: 42
+
+model:
+  arch: jit-s2-vmamba
+  depth: 12
+  hidden_dim: 384
+  patch_size: 8
+  in_context_tokens: 32
+  bottleneck_dim: 128
+  ssm_d_state: 16
+  ssm_expand: 2
+  dropout: 0.0
+
+training:
+  epochs: 200
+  batch_size: 128
+  lr: 2.0e-4
+  optimizer: adam
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_epochs: 5
+  ema_decay: 0.9999
+
+diffusion:
+  prediction: x_pred
+  loss: v_loss
+  time_sampler: logit_normal
+  time_mu: -0.8
+  time_sigma: 0.8
+  noise_scale: 1.0
+  cfg_drop_prob: 0.1
+
+sampling:
+  ode_solver: heun
+  ode_steps: 50
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+  batch_size: 16
+
+logging:
+  save_every: 10
+  sample_every: 10
+  output_dir: experiments/cifar10/jit-s2-vmamba-baseline

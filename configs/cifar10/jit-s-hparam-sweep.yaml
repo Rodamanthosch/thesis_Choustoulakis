@@ -1,0 +1,49 @@
+# configs/cifar10/jit-s-hparam-sweep.yaml
+# Hyperparameter sweep config — edit the 'sweep' section to define search space.
+# Use with Weights & Biases (wandb sweep) or a manual loop.
+
+experiment:
+  name: jit-s-cifar10-hparam-sweep
+  dataset: cifar10
+  seed: 42
+
+# ── Fixed settings ────────────────────────────────────────
+model:
+  arch: jit-s
+  depth: 12
+  hidden_dim: 384
+  heads: 6
+  patch_size: 8
+  in_context_tokens: 32
+  bottleneck_dim: 128
+
+diffusion:
+  prediction: x_pred
+  loss: v_loss
+  time_sampler: logit_normal
+  time_mu: -0.8
+  time_sigma: 0.8
+  cfg_drop_prob: 0.1
+
+sampling:
+  ode_solver: heun
+  ode_steps: 50
+
+# ── Sweep space (wandb format) ────────────────────────────
+sweep:
+  method: bayes           # random | grid | bayes
+  metric:
+    name: fid
+    goal: minimize
+  parameters:
+    lr:
+      values: [1.0e-4, 2.0e-4, 5.0e-4]
+    batch_size:
+      values: [64, 128, 256]
+    ema_decay:
+      values: [0.9996, 0.9998, 0.9999]
+    cfg_scale:
+      min: 1.5
+      max: 4.0
+    dropout:
+      values: [0.0, 0.1, 0.2]

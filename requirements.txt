@@ -1,0 +1,15 @@
+torch>=2.0.0
+torchvision>=0.15.0
+timm
+einops
+thop
+pyyaml
+numpy
+matplotlib
+tqdm
+pillow
+scipy
+clean-fid        # FID evaluation
+wandb            # optional: experiment tracking
+jupyter
+ipykernel

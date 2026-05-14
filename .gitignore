@@ -1,0 +1,41 @@
+# ── Checkpoints & model weights ──────────────────────────
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# ── Datasets (download separately) ───────────────────────
+data/
+datasets/
+
+# ── Experiment outputs (keep metrics, ignore heavy files) ─
+experiments/*/samples/
+experiments/*/checkpoints/
+
+# ── Jupyter ───────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Experiment tracking ───────────────────────────────────
+wandb/
+runs/
+lightning_logs/
+mlruns/
+
+# ── Environment ───────────────────────────────────────────
+.env
+.venv/
+env/
+venv/
+
+# ── OS ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

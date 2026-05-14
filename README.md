@@ -57,16 +57,61 @@ jit-research/
 
 ## Setup
 
+### Attention model (JiT-S) — standard install
 ```bash
 git clone https://github.com/Rodamanthosch/thesis_Choustoulakis.git
 cd thesis_Choustoulakis
 pip install -r requirements.txt
 ```
 
-**For ViM and VMamba models**, install Mamba CUDA kernels (requires CUDA 12, Python 3.12):
-```bash
-pip install causal-conv1d>=1.5.0 mamba-ssm>=2.2.4
+### ViM and VMamba models — Kaggle / Mamba setup
+
+Mamba requires prebuilt CUDA wheels. Run this **once** before any Mamba experiment, then **restart the runtime**:
+
+```python
+# === RUN ONCE, THEN RESTART RUNTIME ===
+
+# 1) Pin torch to 2.5.1 (required for prebuilt mamba-ssm wheels)
+!pip install -q torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cu124
+
+# 2) Download prebuilt CUDA kernel wheels (no compilation needed)
+import os
+WHEELS = [
+    ("https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.0.post8/"
+     "causal_conv1d-1.5.0.post8+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"),
+    ("https://github.com/state-spaces/mamba/releases/download/v2.2.4/"
+     "mamba_ssm-2.2.4+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"),
+]
+for url in WHEELS:
+    fname = url.split("/")[-1]
+    if not os.path.exists(f"/kaggle/working/{fname}"):
+        os.system(f"wget -q {url}")
+
+!pip install -q /kaggle/working/causal_conv1d-1.5.0.post8+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+!pip install -q /kaggle/working/mamba_ssm-2.2.4+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+!pip install -q pytorch-fid thop
+
+# 3) Patch mamba-ssm utils/generation.py (fixes a removed transformers class)
+import glob
+for path in glob.glob("/usr/local/lib/python*/dist-packages/mamba_ssm/utils/generation.py"):
+    with open(path) as f: src = f.read()
+    new = src.replace(
+        "from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput, TextStreamer",
+        "from transformers.generation import GenerateDecoderOnlyOutput, TextStreamer",
+    ).replace(
+        "output_cls = GreedySearchDecoderOnlyOutput if top_k == 1 else SampleDecoderOnlyOutput",
+        "output_cls = GenerateDecoderOnlyOutput",
+    )
+    if new != src:
+        with open(path, "w") as f: f.write(new)
+        print(f"✅ Patched {path}")
+
+# >>> RESTART RUNTIME NOW, then run your experiment <<<
 ```
+
+> **Note:** `causal-conv1d` is only required for the ViM model. VMamba only needs `mamba-ssm`.
+> The JiT-S attention model needs neither.
 
 ---
 

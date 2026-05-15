@@ -10,6 +10,11 @@ EXTENDED with CFG support (off by default = matches notebooks exactly):
   - cfg_interval           → restrict CFG to timestep range [low, high] (JiT paper Fig 6)
 
 With all defaults, this is byte-for-byte the same as the notebook Denoiser.
+
+PATCH: BUG #6 — CFG interval mask now uses the strict-on-low, strict-on-high
+       form from LTH14/JiT denoiser.py:
+           (t < high) & ((low == 0) | (t > low))
+       (was: (t >= low) & (t <= high))
 """
 
 import torch
@@ -195,10 +200,16 @@ class Denoiser(nn.Module):
         x_pred_double = self.net(z_double, t_double, y_double)
         x_cond, x_uncond = x_pred_double[:bsz], x_pred_double[bsz:]
 
-        # CFG interval: only apply guidance within [low, high] timestep range
+        # ─── BUG #6 FIX: CFG interval mask now matches LTH14/JiT denoiser.py ──
+        # Reference:  (t < high) & ((low == 0) | (t > low))
+        # Was:        (t >= low) & (t <= high)
         low, high = self.cfg_interval
         t_scalar = t_flat.view(bsz, 1, 1, 1)
-        in_interval = (t_scalar >= low) & (t_scalar <= high)
+        if low == 0:
+            in_interval = (t_scalar < high)
+        else:
+            in_interval = (t_scalar < high) & (t_scalar > low)
+        # ──────────────────────────────────────────────────────────────────────
         scale = torch.where(in_interval,
                              torch.full_like(t_scalar, self.cfg_scale),
                              torch.ones_like(t_scalar))

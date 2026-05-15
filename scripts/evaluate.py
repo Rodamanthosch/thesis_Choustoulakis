@@ -15,6 +15,19 @@ Usage:
         --config  configs/cifar10/jit-s-baseline.yaml \\
         --checkpoint experiments/cifar10/jit-s-baseline/checkpoint-best.pt \\
         --n_samples 50000
+
+    # CFG sweep (paper Fig. 6):
+    python scripts/evaluate.py --config ... --checkpoint ... \\
+        --cfg_scale 2.5 --cfg_interval 0.1 1.0 --ode_steps 50 --seed 42
+
+PATCHES:
+  BUG #3  — Real reference uses the FULL 50K CIFAR-10 training set
+            (was: truncated to n_samples). Required for canonical FID protocol.
+  BUG #7  — CLI overrides for --cfg_scale, --cfg_interval, --ode_steps, --seed
+            for paper-faithful CFG sweep ablations.
+  BUG #8  — Equal-per-class label distribution (was: random uniform labels).
+            Matches LTH14/JiT engine_jit.py line 87-91.
+  BUG #9  — Seeded torch RNG at start of main() for reproducible generation.
 """
 
 import argparse, os, sys, json
@@ -79,13 +92,36 @@ def main():
     parser.add_argument("--ema",        type=int, default=1,     choices=[1, 2], help="Which EMA to use (1 or 2)")
     parser.add_argument("--out_dir",    default=None, help="Where to save results (default: next to checkpoint)")
     parser.add_argument("--skip_fid",   action="store_true", help="Skip FID/IS (only run complexity)")
+    # ─── BUG #7 FIX: CLI overrides for paper-faithful CFG sweep ablations ───
+    parser.add_argument("--cfg_scale",    type=float, default=None,
+                        help="Override cfg.cfg_scale from config (for CFG sweeps).")
+    parser.add_argument("--cfg_interval", nargs=2, type=float, default=None,
+                        metavar=("LOW", "HIGH"),
+                        help="Override cfg.cfg_interval from config (e.g. --cfg_interval 0.1 1.0).")
+    parser.add_argument("--ode_steps",    type=int, default=None,
+                        help="Override sampling.steps from config.")
+    parser.add_argument("--seed",         type=int, default=42,
+                        help="Seed for reproducible generation (BUG #9 fix).")
+    # ────────────────────────────────────────────────────────────────────────
     args = parser.parse_args()
+
+    # ─── BUG #9 FIX: deterministic generation ──────────────────────────────
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    # ───────────────────────────────────────────────────────────────────────
 
     cfg    = load_config(args.config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     m_cfg  = cfg["model"]
     s_cfg  = cfg["sampling"]
     c_cfg  = cfg["cfg"]
+
+    # ─── BUG #7 FIX: apply CLI overrides before constructing Denoiser ───────
+    if args.cfg_scale    is not None: c_cfg["cfg_scale"]    = args.cfg_scale
+    if args.cfg_interval is not None: c_cfg["cfg_interval"] = list(args.cfg_interval)
+    if args.ode_steps    is not None: s_cfg["steps"]        = args.ode_steps
+    # ────────────────────────────────────────────────────────────────────────
 
     out_dir = args.out_dir or os.path.join(os.path.dirname(args.checkpoint), "eval")
     os.makedirs(out_dir, exist_ok=True)
@@ -95,6 +131,10 @@ def main():
     print(f"  Checkpoint  : {args.checkpoint}")
     print(f"  EMA copy    : {args.ema}")
     print(f"  Samples     : {args.n_samples}")
+    print(f"  CFG scale   : {c_cfg['cfg_scale']}")
+    print(f"  CFG interval: {c_cfg['cfg_interval']}")
+    print(f"  ODE steps   : {s_cfg['steps']}")
+    print(f"  Seed        : {args.seed}")
     print(f"  Device      : {device}")
     print(f"{'='*60}\n")
 
@@ -150,13 +190,24 @@ def main():
     os.makedirs(gen_dir, exist_ok=True)
     os.makedirs(real_dir, exist_ok=True)
 
+    # ─── BUG #8 FIX: equal-per-class labels (matches engine_jit.py) ──────────
+    num_classes = m_cfg["num_classes"]
+    assert args.n_samples % num_classes == 0, \
+        f"n_samples ({args.n_samples}) must be divisible by num_classes ({num_classes}) " \
+        f"for equal-per-class generation."
+    per_class = args.n_samples // num_classes
+    all_labels = torch.arange(num_classes).repeat_interleave(per_class).to(device)
+    # ────────────────────────────────────────────────────────────────────────
+
     denoiser.eval()
     count = 0
     with torch.no_grad(), denoiser.swap_ema(args.ema):
         pbar = tqdm(total=args.n_samples, desc="Generating")
         while count < args.n_samples:
             bs = min(args.batch_size, args.n_samples - count)
-            y  = torch.randint(0, m_cfg["num_classes"], (bs,), device=device)
+            # ─── BUG #8 FIX: slice deterministic labels instead of random ───
+            y  = all_labels[count:count + bs]
+            # ────────────────────────────────────────────────────────────────
             imgs = denoiser.generate(y)
             imgs = ((imgs.clamp(-1, 1) + 1) / 2).cpu()
             for j in range(bs):
@@ -167,7 +218,10 @@ def main():
     print(f"✅ {count} images saved to {gen_dir}\n")
 
     # ── 3. Save real images ───────────────────────────────────────────────────
-    print(f"── Saving {args.n_samples} real images ────────────────────────────")
+    # ─── BUG #3 FIX: save the FULL training set as FID reference, not a subset.
+    # Matches the canonical DDPM/EDM/Score-SDE CIFAR-10 FID protocol where the
+    # reference distribution is estimated from all 50 000 training images.
+    # ────────────────────────────────────────────────────────────────────────
     dataset = cfg["experiment"]["dataset"]
     data_dir = cfg["experiment"].get("data_dir", "./data")
 
@@ -185,13 +239,18 @@ def main():
             ])
         )
 
-    written = 0
-    for img, _ in real_ds:
-        if written >= args.n_samples:
-            break
-        save_image(img, f"{real_dir}/{written:05d}.png")
-        written += 1
-    print(f"✅ {written} real images saved to {real_dir}\n")
+    # If the real directory is already fully populated from a previous run,
+    # skip regeneration (this folder is identical for every model so it can
+    # be cached and shared across all evaluations).
+    expected_real = len(real_ds)
+    existing_real = len(os.listdir(real_dir)) if os.path.exists(real_dir) else 0
+    if existing_real >= expected_real:
+        print(f"── Real images already cached ({existing_real} files) ─────────")
+    else:
+        print(f"── Saving {expected_real} real images (full reference set) ────")
+        for written, (img, _) in enumerate(real_ds):
+            save_image(img, f"{real_dir}/{written:05d}.png")
+        print(f"✅ {expected_real} real images saved to {real_dir}\n")
 
     # ── 4. FID + IS ───────────────────────────────────────────────────────────
     print("── FID / IS ────────────────────────────────────────────────")
@@ -211,7 +270,6 @@ def main():
 def _save_results(results, out_dir):
     path = os.path.join(out_dir, "eval_results.json")
     with open(path, "w") as f:
-        import json
         json.dump(results, f, indent=2)
     print(f"\n{'='*60}")
     print(f"  Results saved → {path}")

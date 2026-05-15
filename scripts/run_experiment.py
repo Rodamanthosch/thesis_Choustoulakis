@@ -19,6 +19,11 @@ Usage:
     # Resume:
     python scripts/run_experiment.py --config configs/cifar10/jit-s-baseline.yaml \\
         checkpoint.resume_from=experiments/cifar10/jit-s-baseline/checkpoint-last.pt
+
+PATCHES:
+  BUG #4   — autocast dtype is bf16 (matches LTH14/JiT engine_jit.py)
+             and GradScaler is removed (bf16 doesn't need it).
+  BUG #15  — num_workers bumped from 4 to 12 (matches LTH14/JiT main_jit.py).
 """
 
 import argparse, os, sys, yaml
@@ -215,7 +220,9 @@ def main():
         batch_size  = t_cfg["batch_size"] // world_size,  # per-GPU batch size
         shuffle     = (sampler is None),
         sampler     = sampler,
-        num_workers = 4,
+        # ─── BUG #15 FIX: num_workers=12 matches LTH14/JiT main_jit.py ───
+        num_workers = 12,
+        # ────────────────────────────────────────────────────────────────
         pin_memory  = True,
         drop_last   = True,
     )
@@ -224,7 +231,6 @@ def main():
     warmup_steps    = t_cfg["warmup_epochs"] * steps_per_epoch
     lr_at_step      = make_lr_fn(peak_lr, warmup_steps)
     use_amp         = "cuda" in device and t_cfg.get("amp", True)
-    scaler          = torch.amp.GradScaler("cuda") if use_amp else None
 
     out_dir = ck_cfg["output_dir"]
     if main_proc:
@@ -262,16 +268,18 @@ def main():
                 pg["lr"] = lr_at_step(global_step)
 
             optimizer.zero_grad(set_to_none=True)
-            if scaler is not None:
-                with torch.amp.autocast("cuda"):
+            # ─── BUG #4 FIX: bf16 autocast (no GradScaler — bf16 doesn't need it) ──
+            # Matches LTH14/JiT engine_jit.py line 33-35 exactly.
+            if use_amp:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     loss = denoiser(images, labels)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                loss.backward()
+                optimizer.step()
             else:
                 loss = denoiser(images, labels)
                 loss.backward()
                 optimizer.step()
+            # ──────────────────────────────────────────────────────────────────────
 
             # EMA only on main process (tracks raw_net weights)
             if main_proc:

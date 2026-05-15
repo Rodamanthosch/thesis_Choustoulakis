@@ -214,10 +214,16 @@ class JiT(nn.Module):
                 torch.zeros(1, in_context_len, hidden_size)
             )
 
-        # 2D RoPE — num_cls_token=in_context_len so in-context tokens are not rotated
+        # 2D RoPE — TWO instances to match LTH14/JiT model_jit.py exactly:
+        #   feat_rope (num_cls_token=0)        — used by blocks before in_context_start
+        #   feat_rope_incontext (num_cls_token=in_context_len) — used after the prepend
+        # This is the BUG #1 fix.
         half_head_dim = hidden_size // num_heads // 2
         hw_seq_len = input_size // patch_size
         self.feat_rope = VisionRotaryEmbeddingFast(
+            dim=half_head_dim, pt_seq_len=hw_seq_len, num_cls_token=0
+        )
+        self.feat_rope_incontext = VisionRotaryEmbeddingFast(
             dim=half_head_dim, pt_seq_len=hw_seq_len, num_cls_token=in_context_len
         )
 
@@ -289,17 +295,21 @@ class JiT(nn.Module):
         x = x + self.pos_embed
 
         for i, block in enumerate(self.blocks):
-            # Prepend in-context tokens starting at in_context_start
-            if self.in_context_len > 0 and i >= self.in_context_start:
+            # BUG #1 FIX: prepend ONCE at i == in_context_start
+            # (was: i >= in_context_start, which re-prepended at every block)
+            if self.in_context_len > 0 and i == self.in_context_start:
                 ctx = y_emb[:, None, :].expand(-1, self.in_context_len, -1)
                 ctx = ctx + self.incontext_pos_embed
                 x = torch.cat([ctx, x], dim=1)
 
-            x = block(x, c, feat_rope=self.feat_rope)
+            # BUG #1 FIX: use the right RoPE — no-skip before in_context_start,
+            # skip-in_context_len after. Matches model_jit.py.
+            rope = self.feat_rope if i < self.in_context_start else self.feat_rope_incontext
+            x = block(x, c, feat_rope=rope)
 
-            # Remove in-context tokens after each block
-            if self.in_context_len > 0 and i >= self.in_context_start:
-                x = x[:, self.in_context_len:, :]
+        # BUG #1 FIX: strip ONCE after the loop (was: per-block strip inside loop)
+        if self.in_context_len > 0:
+            x = x[:, self.in_context_len:, :]
 
         x = self.final_layer(x, c)
         return self.unpatchify(x)

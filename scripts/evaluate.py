@@ -28,6 +28,9 @@ PATCHES:
   BUG #8  — Equal-per-class label distribution (was: random uniform labels).
             Matches LTH14/JiT engine_jit.py line 87-91.
   BUG #9  — Seeded torch RNG at start of main() for reproducible generation.
+  BUG #20 — FLOPs/MACs/params now computed via src/flops_counter.py
+            (was: thop, which silently misses nn.Embedding params AND the
+            SDPA attention matmuls). Replaces the thop call in section 1.
 """
 
 import argparse, os, sys, json
@@ -154,22 +157,37 @@ def main():
     results = {}
 
     # ── 1. Complexity (MACs, params, throughput) ──────────────────────────────
+    # ─── BUG #20 FIX: use src/flops_counter.py instead of thop. ─────────────
+    # thop silently misses nn.Embedding params (≈0.7M for 1000 classes) AND
+    # the SDPA attention matmuls (≈5% of total for JiT-B/16). The new counter
+    # uses fvcore with custom hooks for: scaled_dot_product_attention,
+    # selective_scan_fn (ViM + VMamba), and causal_conv1d_fn (ViM).
+    # ────────────────────────────────────────────────────────────────────────
     print("── Complexity ──────────────────────────────────────────────")
-    n_params = sum(p.numel() for p in net.parameters()) / 1e6
-    print(f"  Parameters : {n_params:.2f} M")
-    results["params_M"] = round(n_params, 2)
-
     try:
-        from thop import profile
-        dummy_x = torch.randn(1, 3, m_cfg["input_size"], m_cfg["input_size"], device=device)
-        dummy_t = torch.rand(1, device=device)
-        dummy_y = torch.randint(0, m_cfg["num_classes"], (1,), device=device)
-        macs, _ = profile(net, inputs=(dummy_x, dummy_t, dummy_y), verbose=False)
-        gflops  = (macs * 2) / 1e9
-        print(f"  GFLOPs     : {gflops:.4f}")
-        results["gflops"] = round(gflops, 4)
+        from src.flops_counter import count_complexity, print_report
+        complexity = count_complexity(
+            net,
+            img_size=m_cfg["input_size"],
+            in_channels=m_cfg["in_channels"],
+            num_classes=m_cfg["num_classes"],
+            device=device,
+        )
+        # Print the full validity-checking report so we can verify the count.
+        print_report(complexity, model_name=cfg["experiment"]["name"])
+
+        results["params_M"]      = round(complexity["params_total"] / 1e6, 4)
+        results["gmacs"]         = round(complexity["macs_total"] / 1e9, 4)
+        results["gflops_strict"] = round(complexity["flops_strict_total"] / 1e9, 4)
+        # Keep the old 'gflops' key as an alias for backward compatibility
+        # (we report MACs there since that's the paper "Gflops" convention).
+        results["gflops"]        = results["gmacs"]
     except Exception as e:
-        print(f"  GFLOPs     : skipped ({e})")
+        print(f"  Complexity : skipped ({e})")
+        # Minimal fallback so 'params_M' still gets logged.
+        n_params = sum(p.numel() for p in net.parameters()) / 1e6
+        print(f"  Parameters : {n_params:.2f} M")
+        results["params_M"] = round(n_params, 2)
 
     if device == "cuda":
         tput = measure_throughput(net,

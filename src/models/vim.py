@@ -301,3 +301,77 @@ class JiTViM(nn.Module):
 
         x = self.final_layer(x, c)
         return self.unpatchify(x)
+class VisionMamba3Bidirectional(nn.Module):
+    """
+    ViM-style bidirectional wrapper around the official Mamba3 block.
+
+    This is not the old Vim/Mamba-1 mixer. It replaces the internal mixer with
+    official Mamba3, then applies it in forward and backward sequence order.
+
+    Requires:
+        MAMBA_FORCE_BUILD=TRUE pip install --no-cache-dir --force-reinstall \
+          git+https://github.com/state-spaces/mamba.git --no-build-isolation
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 128,
+        headdim: int = 64,
+        is_mimo: bool = True,
+        mimo_rank: int = 4,
+        chunk_size: int = 16,
+        is_outproj_norm: bool = False,
+        bidirectional: bool = True,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+
+        try:
+            from mamba_ssm import Mamba3
+        except ImportError as exc:
+            raise ImportError(
+                "VisionMamba3Bidirectional requires official Mamba3. "
+                "Install the upstream state-spaces/mamba package from source."
+            ) from exc
+
+        self.bidirectional = bidirectional
+
+        self.fwd = Mamba3(
+            d_model=d_model,
+            d_state=d_state,
+            headdim=headdim,
+            is_mimo=is_mimo,
+            mimo_rank=mimo_rank,
+            chunk_size=chunk_size,
+            is_outproj_norm=is_outproj_norm,
+        )
+
+        if bidirectional:
+            self.bwd = Mamba3(
+                d_model=d_model,
+                d_state=d_state,
+                headdim=headdim,
+                is_mimo=is_mimo,
+                mimo_rank=mimo_rank,
+                chunk_size=chunk_size,
+                is_outproj_norm=is_outproj_norm,
+            )
+        else:
+            self.bwd = None
+
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, L, D)
+        """
+        y_fwd = self.fwd(x)
+
+        if self.bwd is None:
+            return self.proj_drop(y_fwd)
+
+        y_bwd = self.bwd(torch.flip(x, dims=[1]))
+        y_bwd = torch.flip(y_bwd, dims=[1])
+
+        return self.proj_drop(y_fwd + y_bwd)

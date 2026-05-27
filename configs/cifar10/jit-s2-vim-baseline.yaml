@@ -9,6 +9,7 @@ experiment:
   seed: 42
 
 model:
+  mixer_impl: vim
   input_size: 32
   patch_size: 2
   in_channels: 3

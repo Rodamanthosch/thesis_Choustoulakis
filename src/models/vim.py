@@ -18,6 +18,28 @@ NOTABLE DIFFERENCES vs attention and VMamba:
   - RMSNorm for output norm.
   - Fixed 2D sin-cos positional embedding, no attention RoPE.
   - Class/timestep conditioning is still AdaLN-Zero outside the mixer.
+
+OPTIONAL CONDITIONING EXTENSIONS (both OFF by default = baseline byte-for-byte):
+
+  Option A — in-context class tokens (in_context_len > 0):
+    Prefix-token conditioning. Plumbing follows DiS (feizc/DiS, bimamba_type="v2"):
+    conditioning tokens are concatenated at the FRONT of the sequence, given
+    learnable positional slots, scanned by BiMambaV2, and stripped after the
+    final block. Token CONTENT follows JiT Table 9 (K repeated class embeddings),
+    so JiT-S and JiT-S2-ViM differ only in the mixer -> the controlled test of
+    "does the JiT in-context mechanism survive the SSM scan compression (eq. 5)".
+      in_context_len   : number of prepended class tokens (DiS uses 2; JiT-B uses K=4)
+      in_context_start : block index to prepend at (DiS=0; JiT-B=4)
+
+  Option C — DiMSUM Conditional Mamba (cond_init="conv_state"):
+    DiMSUM (VinAIResearch/DiMSUM) "Conditional Mamba" sets the SSM prior from the
+    condition. Its RELEASED code does this through a forked causal_conv1d
+    (causal_conv1d_fwd_cond) + forked mamba_inner_fn_cond, feeding a d_inner-wide
+    projection of c as the conv's initial state (NOT a full d_inner x d_state SSM
+    state, and the stock selective_scan path does not inject it at all). We
+    reproduce that exact mechanism on STOCK kernels: a shared cond_proj(c) -> d_inner
+    seeds the (d_conv-1) causal-conv left-pad window of BOTH scan directions,
+    instead of zeros. No forked CUDA op required; cond_init="none" is the baseline.
 """
 
 import math
@@ -93,20 +115,38 @@ class _DirectionalSSM(nn.Module):
         self.D = nn.Parameter(torch.ones(d_inner))
         self.D._no_weight_decay = True
 
-    def forward(self, x_inner):
+    def forward(self, x_inner, seed=None):
         """
         x_inner: (B, L, E)
+        seed:    (B, E) | None
+                 DiMSUM-style conditional initial conv state (option C). When given,
+                 the (d_conv-1) causal-conv left-pad window is filled with this
+                 projected condition instead of zeros, so the earliest scan steps
+                 carry the condition into the SSM hidden state. When None, the fused
+                 causal_conv1d kernel is used (byte-for-byte baseline path).
         returns: (B, L, E)
         """
         x_t = x_inner.transpose(1, 2).contiguous()  # (B, E, L)
 
-        # Depthwise causal Conv1d with fused SiLU.
-        x_t = causal_conv1d_fn(
-            x_t,
-            self.conv1d.weight.squeeze(1),
-            self.conv1d.bias,
-            activation="silu",
-        )
+        if seed is None:
+            # Baseline path: fused depthwise causal Conv1d with fused SiLU.
+            x_t = causal_conv1d_fn(
+                x_t,
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                activation="silu",
+            )
+        else:
+            # DiMSUM Conditional-Mamba path, stock-kernel faithful.
+            # Reproduces causal_conv1d_fwd_cond's intent (condition seeds the conv's
+            # initial state) using only F.conv1d — no forked causal-conv1d CUDA op.
+            # seed=0 recovers the baseline exactly.
+            B, E, L = x_t.shape
+            pad = seed[:, :, None].expand(B, E, self.d_conv - 1).to(x_t.dtype)
+            x_padded = torch.cat([pad, x_t], dim=-1)               # (B, E, L + d_conv - 1)
+            x_t = F.conv1d(x_padded, self.conv1d.weight, self.conv1d.bias,
+                           groups=self.d_inner)                    # valid conv -> (B, E, L)
+            x_t = F.silu(x_t)
 
         x_after_conv = x_t.transpose(1, 2).contiguous()  # (B, L, E)
 
@@ -158,6 +198,7 @@ class BiMambaV2(nn.Module):
         expand=2,
         dt_rank=None,
         proj_drop=0.0,
+        d_cond=None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -165,6 +206,13 @@ class BiMambaV2(nn.Module):
         self.d_state = d_state
         self.d_conv = d_conv
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(d_model / 16)
+
+        # DiMSUM Conditional-Mamba (option C): a single shared projection of the
+        # condition c -> d_inner, used to seed BOTH scan directions' conv state.
+        # Mirrors DiMSUM mamba_simple.py (one cond_proj, same seed fed to fwd & bwd).
+        self.d_cond = d_cond
+        if d_cond is not None:
+            self.cond_proj = nn.Linear(d_cond, self.d_inner, bias=True)
 
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
 
@@ -184,20 +232,26 @@ class BiMambaV2(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         """
-        x: (B, L, D)
+        x:    (B, L, D)
+        cond: (B, D) | None  — DiMSUM condition embedding (option C). Projected to
+              (B, d_inner) and used to seed the conv initial state of BOTH scans.
         returns: (B, L, D)
         """
         x = x.contiguous()
 
+        seed = None
+        if cond is not None and self.d_cond is not None:
+            seed = self.cond_proj(cond)  # (B, d_inner)
+
         xz = self.in_proj(x)  # (B, L, 2E)
         x_inner, z = xz.chunk(2, dim=-1)  # each (B, L, E)
 
-        y_fwd = self.ssm_fwd(x_inner)
+        y_fwd = self.ssm_fwd(x_inner, seed=seed)
 
         x_bwd = torch.flip(x_inner, dims=[1])
-        y_bwd = self.ssm_bwd(x_bwd)
+        y_bwd = self.ssm_bwd(x_bwd, seed=seed)
         y_bwd = torch.flip(y_bwd, dims=[1])
 
         z_act = F.silu(z)
@@ -314,6 +368,7 @@ class JiTBlock(nn.Module):
         attn_drop=0.0,
         proj_drop=0.0,
         mixer_impl="vim",
+        cond_init="none",
         mamba3_bidirectional=True,
         mamba3_d_state=128,
         mamba3_headdim=64,
@@ -328,6 +383,20 @@ class JiTBlock(nn.Module):
         del num_heads
         del attn_drop
 
+        # cond_init (option C, DiMSUM Conditional Mamba):
+        #   "none"        -> baseline, condition reaches the SSM only via adaLN
+        #   "conv_state"  -> seed the conv initial state from c (BiMambaV2 only)
+        self.cond_init = cond_init
+        self.supports_cond = (mixer_impl == "vim" and cond_init != "none")
+        if cond_init not in ("none", "conv_state"):
+            raise ValueError(
+                f"Unknown cond_init={cond_init!r}. Use 'none' or 'conv_state'."
+            )
+        if cond_init != "none" and mixer_impl != "vim":
+            raise ValueError(
+                "cond_init='conv_state' is only implemented for mixer_impl='vim'."
+            )
+
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
 
         if mixer_impl == "vim":
@@ -337,6 +406,7 @@ class JiTBlock(nn.Module):
                 d_conv=d_conv,
                 expand=expand,
                 proj_drop=proj_drop,
+                d_cond=hidden_size if cond_init == "conv_state" else None,
             )
         elif mixer_impl == "mamba3":
             self.mixer = VisionMamba3Bidirectional(
@@ -371,7 +441,10 @@ class JiTBlock(nn.Module):
         )
 
         mixer_in = modulate(self.norm1(x), shift_msa, scale_msa)
-        mixer_out = self.mixer(mixer_in)
+        if self.supports_cond:
+            mixer_out = self.mixer(mixer_in, cond=c)
+        else:
+            mixer_out = self.mixer(mixer_in)
         x = x + gate_msa.unsqueeze(1) * mixer_out
 
         mlp_in = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -415,6 +488,18 @@ class JiTViM(nn.Module):
         # Mixer selection.
         mixer_impl="vim",
 
+        # ── Option A: in-context class tokens (DiS-style prefix conditioning) ──
+        #   Plumbing follows DiS (concat conditioning tokens at the front of the
+        #   sequence, learnable positional slots, strip after the final block,
+        #   BiMambaV2 mixer). Token CONTENT follows JiT Table 9 (K repeated class
+        #   embeddings) so JiT-S and JiT-S2-ViM differ only in the mixer.
+        #   in_context_len=0 -> off (byte-for-byte baseline).
+        in_context_len: int = 0,
+        in_context_start: int = 0,
+
+        # ── Option C: DiMSUM Conditional-Mamba seeding ("none" | "conv_state") ──
+        cond_init: str = "none",
+
         # Official Mamba3 knobs; used only when mixer_impl="mamba3".
         mamba3_bidirectional=True,
         mamba3_d_state=128,
@@ -432,6 +517,9 @@ class JiTViM(nn.Module):
         self.hidden_size = hidden_size
         self.input_size = input_size
         self.num_classes = num_classes
+        self.in_context_len = in_context_len
+        self.in_context_start = in_context_start
+        self.cond_init = cond_init
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
@@ -452,6 +540,14 @@ class JiTViM(nn.Module):
             requires_grad=False,
         )
 
+        # Learnable positional slots for the in-context tokens (option A).
+        # Matches jit.py exactly: zeros-initialised, learnable, only the patch
+        # grid uses the fixed sin-cos table so baseline positions are unchanged.
+        if in_context_len > 0:
+            self.incontext_pos_embed = nn.Parameter(
+                torch.zeros(1, in_context_len, hidden_size)
+            )
+
         # Middle-half dropout slot, matching your original structure.
         lo, hi = depth // 4, depth // 4 * 3
 
@@ -466,6 +562,7 @@ class JiTViM(nn.Module):
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 mixer_impl=mixer_impl,
+                cond_init=cond_init,
                 mamba3_bidirectional=mamba3_bidirectional,
                 mamba3_d_state=mamba3_d_state,
                 mamba3_headdim=mamba3_headdim,
@@ -546,8 +643,19 @@ class JiTViM(nn.Module):
         x = self.x_embedder(x)
         x = x + self.pos_embed
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            # Option A: prepend JiT-style in-context class tokens ONCE, at
+            # block in_context_start. Plumbed like DiS (concat at the front,
+            # learnable positional slots); BiMambaV2 scans any L unchanged.
+            if self.in_context_len > 0 and i == self.in_context_start:
+                ctx = y_emb[:, None, :].expand(-1, self.in_context_len, -1)
+                ctx = ctx + self.incontext_pos_embed
+                x = torch.cat([ctx, x], dim=1)
             x = block(x, c)
+
+        # Strip the in-context tokens once, after the final block (DiS: x[:, extras:]).
+        if self.in_context_len > 0:
+            x = x[:, self.in_context_len:, :]
 
         x = self.final_layer(x, c)
 

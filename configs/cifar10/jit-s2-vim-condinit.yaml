@@ -1,0 +1,78 @@
+# ============================================================
+# JiT-S2-ViM (BiMamba) on CIFAR-10 — OPTION C: DiMSUM Conditional Mamba
+# ------------------------------------------------------------
+# DiMSUM (VinAIResearch/DiMSUM) "Conditional Mamba" seeds the SSM prior from the
+# condition. Its released code does this through a FORKED causal_conv1d
+# (causal_conv1d_fwd_cond) + forked mamba_inner_fn_cond, feeding a d_inner-wide
+# projection of c as the conv's initial state — the stock selective_scan path does
+# NOT inject it, and the fork is half-disabled. We reproduce the SAME mechanism on
+# STOCK kernels: a shared cond_proj(c) -> d_inner seeds the (d_conv-1) causal-conv
+# left-pad window of BOTH scan directions, instead of zeros. No forked CUDA op.
+#
+# NOTE: with cond_init="conv_state" the conditioned blocks use F.conv1d (seedable)
+# instead of the fused causal_conv1d kernel. count_complexity still accounts the
+# conv via fvcore's native conv handler; the only extra params are one cond_proj
+# Linear (hidden_size -> d_inner) per block.
+# ============================================================
+
+experiment:
+  name: jit-s2-vim-cifar10-condinit
+  model: vim            # jit | vim | vmamba
+  dataset: cifar10
+  seed: 42
+
+model:
+  mixer_impl: vim
+  input_size: 32
+  patch_size: 2
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6          # unused by vim, kept for parity
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 10
+  attn_drop: 0.0
+  proj_drop: 0.0
+  # Mamba knobs
+  d_state: 16
+  d_conv: 4
+  expand: 1             # paper-faithful Vim (NOT expand=2)
+  # ── Option A: off here ──
+  in_context_len: 0
+  in_context_start: 0
+  # ── Option C: DiMSUM Conditional Mamba ──
+  cond_init: conv_state # none | conv_state
+
+training:
+  epochs: 200
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.0
+  cfg_scale: 1.0
+  cfg_interval: [0.0, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/cifar10/jit-s2-vim-condinit

@@ -105,6 +105,9 @@ def build_model(cfg):
             num_classes=m["num_classes"], bottleneck_dim=m["bottleneck_dim"],
             d_state=m.get("d_state", 16), d_conv=m.get("d_conv", 4),
             expand=m.get("expand", 1),
+            in_context_len=m.get("in_context_len", 0),
+            in_context_start=m.get("in_context_start", 0),
+            cond_init=m.get("cond_init", "none"),
         )
     elif arch == "vmamba":
         from src.models.vmamba import JiTVMamba

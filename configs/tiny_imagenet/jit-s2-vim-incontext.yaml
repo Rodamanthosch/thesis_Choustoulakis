@@ -1,0 +1,71 @@
+# ============================================================
+# JiT-S2-ViM (BiMamba v2) on Tiny-ImageNet 64x64 - OPTION A: in-context tokens
+# Reference row (Table 1): JiT-S-Vim v2/8, Tiny-IN 64, 200 cls, 31.57M, 2.63 GFLOPs,
+#   100 ep, batch 128, blr 5e-5, beta2 0.95, adaLN (baseline FID 79.40).
+# Option A adds DiS-style in-context class tokens on top of that baseline.
+# ============================================================
+
+experiment:
+  name: jit-s2-vim-tinyin-incontext
+  model: vim
+  dataset: imagenet                 # ImageFolder; works on tiny-imagenet-200/train
+  data_dir: ./data/tiny-imagenet-200   # <-- set to your tiny-imagenet-200 path
+  seed: 42
+
+model:
+  mixer_impl: vim                   # BiMamba v2
+  input_size: 64                    # Tiny-IN native res
+  patch_size: 8                     # 64/8 = 8x8 = 64 tokens
+  in_channels: 3
+  hidden_size: 384                  # S scale
+  depth: 12
+  num_heads: 6                      # unused by vim, kept for parity
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 4
+  expand: 1                         # paper-faithful Vim (NOT expand=2)
+  # -- Option A: in-context class tokens --
+  in_context_len: 1                 # DiS-style single class token; raise to sweep K
+  in_context_start: 0
+  # -- Option C: off here --
+  cond_init: none
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5                       # Table LR 5e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]               # beta2 = 0.95 (Vim row in Table 1)
+  weight_decay: 0.0
+  ema_decay1: 0.9999               # Table caption: EMA 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8                     # unchanged from CIFAR; set a res-shift here if your
+  P_std: 0.8                       #   Tiny-IN runs used a shifted logit-normal schedule
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  # Table caption lists CFG scale=1.5, interval [0.1,1.0] for ALL models, which needs
+  # label dropout during training. If your real ViM baseline was CFG-off, set
+  # label_drop_prob: 0.0 / cfg_scale: 1.0 / cfg_interval: [0.0, 1.0] instead.
+  label_drop_prob: 0.1
+  cfg_scale: 1.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vim-incontext

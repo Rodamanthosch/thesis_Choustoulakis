@@ -1,12 +1,12 @@
 # ============================================================
-# JiT-S on ImageNet 256x256 -- BASELINE ("γραμμικό", adaLN only)
+# JiT-S2-VMamba on ImageNet 256x256 -- BASELINE ("γραμμικό", adaLN only)
 # Aligned with scripts/run_experiment.py (NOT the old src.train schema).
 # Single node, 8x GPU via torchrun. data_dir/output_dir come from run_imagenet.sh.
 # ============================================================
 
 experiment:
-  name: jit-jit-imagenet-baseline
-  model: jit                       # jit | vim | vmamba
+  name: jit-vmamba-imagenet-baseline
+  model: vmamba                       # jit | vim | vmamba
   dataset: imagenet
   data_dir: /path/to/imagenet        # overridden by run_imagenet.sh (folder with train/ + val/)
   seed: 42
@@ -24,8 +24,10 @@ model:
   num_classes: 1000                  # set to your dataset's #classes (e.g. 100 for ImageNet-mini)
   attn_drop: 0.0
   proj_drop: 0.0
-  in_context_len: 0
-  in_context_start: 0
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4
 
 training:
   epochs: 100                        # JiT paper uses 600; 100 matches your other runs. Override via arg.
@@ -59,4 +61,4 @@ checkpoint:
   save_last_freq: 5
   save_archive_freq: 25
   resume_from: null
-  output_dir: experiments/imagenet/jit-jit-baseline
+  output_dir: experiments/imagenet/jit-vmamba-baseline

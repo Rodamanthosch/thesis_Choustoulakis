@@ -1,0 +1,65 @@
+# ============================================================
+# JiT-B2-ViM (BiMamba v2) on ImageNet 256x256 -- BASELINE ("γραμμικό", adaLN only)
+# B scale: hidden 768, depth 12, heads 12, patch 16 (256 tokens) = JiT-B/16 sizing.
+# Same patch/scale across jit/vim/vmamba -> controlled comparison. Aligned with run_experiment.py.
+# ============================================================
+
+experiment:
+  name: jit-b-vim-imagenet-baseline
+  model: vim                       # jit | vim | vmamba
+  dataset: imagenet
+  data_dir: /path/to/imagenet        # overridden by run_imagenet.sh
+  seed: 42
+
+model:
+  mixer_impl: vim
+  input_size: 256
+  patch_size: 16                     # 256/16 = 16x16 = 256 tokens (JiT-B/16). SAME for all variants.
+  in_channels: 3
+  hidden_size: 768                   # B scale
+  depth: 12
+  num_heads: 12                      # 768/64; used by jit, ignored by vim/vmamba
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 1000                  # set to your dataset's #classes
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 4
+  expand: 1
+  in_context_len: 0
+  in_context_start: 0
+  cond_init: none
+
+training:
+  epochs: 100                        # JiT paper runs longer for B; override via arg
+  batch_size: 1024                   # TOTAL -> 128/GPU on 8 (run_experiment divides by world_size)
+  warmup_epochs: 5
+  blr: 5.0e-5                        # lr = blr * total_batch/256 = 2e-4 (JiT ImageNet lr)
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05                        # paper Table 9 (clip of 1-t)
+  noise_scale: 1.0                   # paper: 1.0 * image_size/256 = 1.0 at 256
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5                     # sweep at eval
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/imagenet/jit-b-vim-baseline

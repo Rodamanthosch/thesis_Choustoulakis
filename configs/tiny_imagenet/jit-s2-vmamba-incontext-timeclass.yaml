@@ -1,0 +1,91 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D) on Tiny-ImageNet 64x64 — OPTION A, content=time_class (DiM layout)
+# ------------------------------------------------------------
+# DiM-style condition prefix ported to SS2D: time+class tokens prepended ONCE,
+# pinned at the front, leading all 4 CrossScan directions, persisted & updated
+# across blocks, stripped after the final block. Matches the vmamba SS2D knobs
+# (d_conv=3, expand=1, K=4) and the Tiny-IN row (64px, p=8 -> 64 tokens, 200 cls,
+# 100 ep, batch 128, blr 5e-5, beta2 0.95, EMA 0.9999/0.9996).
+#
+#   in_context_content=time_class  ->  len 2 = [t, y]      (DiM default, used here)
+#                                      len 4 = [t, y, y, t] (DiM mirror; set len: 4)
+#   ONLY 2 or 4 are valid in time_class mode (asserted in JiTVMamba.__init__).
+#
+# Sequence length becomes 64 + 2 = 66 (or 68 for len 4); the SelectiveScan FLOPs
+# hook scales with L automatically, so count_complexity stays correct. The only
+# added parameter is the model-level incontext_pos_embed (1, len, hidden_size).
+#
+# INTERPRETATION: your backbone runs adaLN-Zero fed c = t_emb + y_emb, so the
+# CLASS is already injected every block. This prefix is an ADDITIONAL class
+# pathway on top of that (unlike DiM, whose block adaLN is timestep-only). Read
+# any FID gain vs the adaLN-only baseline as "token help beyond adaLN-with-class".
+#
+# REQUIRES the build_model vmamba branch to pass in_context_{len,start,content}
+# (see build_model_vmamba_branch.txt). Baseline = same file with in_context_len: 0.
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-incontext-timeclass
+  model: vmamba
+  dataset: imagenet                 # ImageFolder; works on tiny-imagenet-200/train
+  data_dir: ./data/tiny-imagenet-200   # <-- set to your tiny-imagenet-200 path
+  seed: 42
+
+model:
+  input_size: 64                    # Tiny-IN native res
+  patch_size: 8                     # 64/8 = 8x8 = 64 tokens
+  in_channels: 3
+  hidden_size: 384                  # S scale
+  depth: 12
+  num_heads: 6                      # unused by vmamba, kept for parity
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  # SS2D knobs (VMamba: d_conv=3, NOT ViM's 4)
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4                              # number of CrossScan directions
+  # -- Option A: DiM-style prefix --
+  in_context_len: 2                 # 2 = [t, y] (DiM); set 4 for the [t,y,y,t] mirror
+  in_context_start: 4               # prefix injected from block 4 onward (blocks 0-3 pure grid)
+  in_context_content: time_class    # time_class | class
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8                      # unchanged from CIFAR; set a res-shift here if your
+  P_std: 0.8                        #   Tiny-IN runs used a shifted logit-normal schedule
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  # Match whatever your JiT-S2-VMamba Tiny-IN BASELINE used, so the comparison is
+  # controlled. If baseline was CFG-off: label_drop_prob 0.0 / cfg_scale 1.0 /
+  # cfg_interval [0.0, 1.0]. Values below match the imagenet configs (label_drop 0.1, cfg_scale 2.5).
+  label_drop_prob: 0.1
+  cfg_scale: 2.5                    # matches all imagenet configs (JiT sweep midpoint)
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-incontext-timeclass
+

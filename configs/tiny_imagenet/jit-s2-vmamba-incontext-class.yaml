@@ -1,0 +1,96 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D) on Tiny-ImageNet 64x64 — OPTION A, content=class (JiT K-sweep)
+# ------------------------------------------------------------
+# JiT-style repeated class tokens ported to SS2D: K copies of the class embedding
+# [y]*K, each with its own learned slot p_k (so identical content, distinct slots
+# -> JiT's r_k = e_y + p_k). Prepended ONCE, pinned at the front, leading all 4
+# CrossScan directions, persisted & updated across blocks, stripped at the end.
+# in_context_len=32 mirrors the JiT (attention) baseline's Table 9 count exactly,
+# so JiT-S vs JiT-S2-VMamba differ only in the mixer + how the prefix propagates.
+#
+#   in_context_content=class  ->  any len >= 1; here K = 32 (JiT Table 9).
+#   Sweep with a CLI override, no new files:
+#     for K in 1 2 4 8 16 32; do
+#       python scripts/run_experiment.py \
+#         --config configs/tiny_imagenet/jit-s2-vmamba-incontext-class.yaml \
+#         model.in_context_len=$K \
+#         checkpoint.output_dir=experiments/tiny_imagenet/vmamba-incontext-K$K
+#     done
+#
+# FLOPs/length note: L = 64 + K image+prefix tokens (K=32 -> 96, +50% scan length).
+# The SelectiveScan hook scales with L, so count_complexity stays correct; the only
+# added parameter is incontext_pos_embed (1, K, hidden_size).
+#
+# INTERPRETATION caveat: adaLN-Zero already carries the class every block, so a
+# flat FID curve across K means "tokens add little beyond adaLN-with-class", NOT
+# "tokens don't carry the class". That is the question this arm answers.
+#
+# REQUIRES the build_model vmamba branch to pass in_context_{len,start,content}
+# (see build_model_vmamba_branch.txt). Baseline = same file with in_context_len: 0.
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-incontext-class
+  model: vmamba
+  dataset: imagenet                 # ImageFolder; works on tiny-imagenet-200/train
+  data_dir: ./data/tiny-imagenet-200   # <-- set to your tiny-imagenet-200 path
+  seed: 42
+
+model:
+  input_size: 64                    # Tiny-IN native res
+  patch_size: 8                     # 64/8 = 8x8 = 64 tokens
+  in_channels: 3
+  hidden_size: 384                  # S scale
+  depth: 12
+  num_heads: 6                      # unused by vmamba, kept for parity
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  # SS2D knobs (VMamba: d_conv=3, NOT ViM's 4)
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4                              # number of CrossScan directions (NOT the token count)
+  # -- Option A: JiT-style repeated class tokens --
+  in_context_len: 32                # K in-context class tokens (JiT Table 9); sweep 1..32
+  in_context_start: 4               # prefix injected from block 4 onward (blocks 0-3 pure grid)
+  in_context_content: class         # time_class | class
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8                      # unchanged from CIFAR; set a res-shift here if your
+  P_std: 0.8                        #   Tiny-IN runs used a shifted logit-normal schedule
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  # Match whatever your JiT-S2-VMamba Tiny-IN BASELINE used, so the comparison is
+  # controlled. If baseline was CFG-off: label_drop_prob 0.0 / cfg_scale 1.0 /
+  # cfg_interval [0.0, 1.0]. Values below match the imagenet configs (label_drop 0.1, cfg_scale 2.5).
+  label_drop_prob: 0.1
+  cfg_scale: 2.5                    # matches all imagenet configs (JiT sweep midpoint)
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-incontext-class
+

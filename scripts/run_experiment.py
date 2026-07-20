@@ -119,6 +119,9 @@ def build_model(cfg):
             num_classes=m["num_classes"], bottleneck_dim=m["bottleneck_dim"],
             d_state=m.get("d_state", 16), d_conv=m.get("d_conv", 3),
             expand=m.get("expand", 1), K=m.get("K", 4),
+            in_context_len=m.get("in_context_len", 0),
+            in_context_start=m.get("in_context_start", 0),
+            in_context_content=m.get("in_context_content", "time_class"),
         )
     else:
         raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba")

@@ -138,55 +138,77 @@ class SS2D(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        """x: (B, L, D) where L == H*W. Returns (B, L, D)."""
-        B, L, D = x.shape
-        assert L == H * W, f"SS2D got L={L} != H*W={H*W}"
+        """
+        x: (B, L_in, D) where L_in == extra_len + H*W, extra_len >= 0.
+
+        DiM-style persistent condition prefix (extra_len > 0):
+          The leading `extra_len` positions are condition tokens. They skip the
+          2D depthwise conv (they have no grid coordinate), are prepended to the
+          head of ALL K CrossScan directions so they lead every scan (DiM pins
+          the condition at scan-position 0), get their own Δ/B/C from the shared
+          x_proj, are scanned together with the grid, then merged across the K
+          directions by a PLAIN SUM — which is the exact cross_merge analog:
+          cross_merge un-permutes each grid direction back to canonical order
+          before summing, but the extras were prepended AFTER cross_scan so they
+          were never flipped/transposed and already sit in canonical order in
+          every direction; their un-permute is the identity, leaving only the
+          sum. The updated extra outputs are returned in-place (positions
+          0..extra_len) so they persist & update across blocks like DiM.
+
+        extra_len == 0 recovers the byte-for-byte baseline path.
+        """
+        B, L_in, D = x.shape
         K = self.K
         d_inner = self.d_inner
         d_state = self.d_state
+        HW = H * W
+        extra_len = L_in - HW
+        assert extra_len >= 0, f"SS2D got L_in={L_in} < H*W={HW}"
 
-        # ── 1. in_proj + reshape to 2D ───────────────────────────────
-        z = self.in_proj(x)                                     # (B, L, d_inner)
-        z2d = z.view(B, H, W, d_inner).permute(0, 3, 1, 2).contiguous()
-        #     z2d: (B, d_inner, H, W)
+        # ── 1. in_proj (extras share in_proj with the grid, as in DiM) ─
+        z_all   = self.in_proj(x)                               # (B, L_in, d_inner)
+        z_extra = z_all[:, :extra_len]                          # (B, extra_len, d_inner)
+        z_grid  = z_all[:, extra_len:]                          # (B, HW, d_inner)
 
-        # ── 2. Depthwise 2D conv + SiLU ──────────────────────────────
+        # ── 2. Grid path: reshape → depthwise 2D conv + SiLU ─────────
+        z2d = z_grid.view(B, H, W, d_inner).permute(0, 3, 1, 2).contiguous()
         z2d = self.act(self.conv2d(z2d))                        # (B, d_inner, H, W)
 
-        # ── 3. CrossScan: 4 directions ───────────────────────────────
-        xs = cross_scan(z2d)                                    # (B, K, d_inner, L)
+        # ── 3. CrossScan: 4 directions over the pure H×W grid ────────
+        xs = cross_scan(z2d)                                    # (B, K, d_inner, HW)
+
+        # ── 3b. Prepend the condition seed to the head of every scan ─
+        if extra_len > 0:
+            # Same seed fed to all K directions; each direction's x_proj[k]
+            # still gives it a distinct Δ/B/C. Seed leads the scan → it seeds
+            # the recurrent state for every image token, in every direction.
+            seed = z_extra.transpose(1, 2)[:, None]             # (B, 1, d_inner, extra_len)
+            seed = seed.expand(B, K, d_inner, extra_len).to(xs.dtype)
+            xs = torch.cat([seed, xs], dim=-1)                  # (B, K, d_inner, extra_len+HW)
+
+        L = xs.shape[-1]                                        # extra_len + HW
 
         # ── 4. STACKED selective scan: one CUDA launch over K*d_inner ─
-        # Flatten the K direction into the channel dim: (B, K*d_inner, L)
-        xs_flat = xs.view(B, K * d_inner, L)
+        xs_flat = xs.reshape(B, K * d_inner, L)
 
-        # Per-direction x_proj: produces (Δ, B_ssm, C_ssm).
-        # xs:             (B, K, d_inner, L)
-        # x_proj_weight:  (K, dt_rank+2*d_state, d_inner)
-        # x_dbl:          (B, K, dt_rank+2*d_state, L)
+        # Per-direction x_proj (also covers the prepended condition tokens):
+        # xs (B,K,d_inner,L) × x_proj_weight (K,dt_rank+2N,d_inner) → (B,K,dt_rank+2N,L)
         x_dbl = torch.einsum("bkdl,kod->bkol", xs, self.x_proj_weight)
 
         dt_r, B_ssm, C_ssm = torch.split(
             x_dbl, [self.dt_rank, d_state, d_state], dim=2
         )
-        # dt_r: (B, K, dt_rank, L); B_ssm, C_ssm: (B, K, d_state, L)
-
-        # dt = dt_proj(dt_r): (K, d_inner, dt_rank) @ (B, K, dt_rank, L) → (B, K, d_inner, L)
         dt = torch.einsum("bkrl,kdr->bkdl", dt_r, self.dt_projs_weight)
 
-        # Flatten K into channel for the kernel call.
-        dt_flat    = dt.contiguous().view(B, K * d_inner, L)            # (B, K*d_inner, L)
-        B_ssm_flat = B_ssm.contiguous().view(B, K, d_state, L)          # (B, K, d_state, L)
-        C_ssm_flat = C_ssm.contiguous().view(B, K, d_state, L)          # (B, K, d_state, L)
+        dt_flat    = dt.contiguous().view(B, K * d_inner, L)
+        B_ssm_flat = B_ssm.contiguous().view(B, K, d_state, L)
+        C_ssm_flat = C_ssm.contiguous().view(B, K, d_state, L)
 
         # A, D, delta_bias always fp32 (small, no upcast cost).
-        # NOTE: do NOT .float() the four large activations below — under autocast they
-        # arrive in fp16 and we want them to stay that way through saved-for-backward.
         A          = -torch.exp(self.A_logs.float()).view(K * d_inner, d_state)
         D_param    = self.Ds.float().view(K * d_inner)
         delta_bias = self.dt_projs_bias.float().view(K * d_inner)
 
-        # selective_scan_fn supports grouped B/C: shape (B, G, d_state, L) with G=K
         y = selective_scan_fn(
             xs_flat,                                      # u: (B, K*d_inner, L)
             dt_flat,                                      # delta: (B, K*d_inner, L)
@@ -200,14 +222,25 @@ class SS2D(nn.Module):
             return_last_state=False,
         )                                                  # (B, K*d_inner, L)
 
-        # ── 5. CrossMerge ────────────────────────────────────────────
-        ys = y.view(B, K, d_inner, L)                     # un-flatten
-        out = cross_merge(ys, H, W)                       # (B, d_inner, L)
-        out = out.transpose(1, 2)                         # (B, L, d_inner)
+        ys = y.view(B, K, d_inner, L)                     # (B, K, d_inner, extra_len+HW)
+
+        # ── 5. Merge. Grid: cross_merge (un-permute + sum). ──────────
+        #        Extras: plain sum over directions (cross_merge analog; no
+        #        un-permute needed — they were never reordered).
+        if extra_len > 0:
+            ys_extra = ys[:, :, :, :extra_len]            # (B, K, d_inner, extra_len)
+            ys_grid  = ys[:, :, :, extra_len:]            # (B, K, d_inner, HW)
+            out_grid  = cross_merge(ys_grid, H, W)        # (B, d_inner, HW)
+            out_extra = ys_extra.sum(dim=1)               # (B, d_inner, extra_len)
+            out = torch.cat([out_extra, out_grid], dim=-1)  # (B, d_inner, extra_len+HW)
+        else:
+            out = cross_merge(ys, H, W)                   # (B, d_inner, HW)  [baseline]
+
+        out = out.transpose(1, 2)                         # (B, L_in, d_inner)
 
         # ── 6. LayerNorm + out_proj ──────────────────────────────────
         out = self.out_norm(out)
-        out = self.out_proj(out)                          # (B, L, D)
+        out = self.out_proj(out)                          # (B, L_in, D)
         return self.proj_drop(out)
 
 
@@ -266,6 +299,15 @@ class JiTVMamba(nn.Module):
         d_conv=3,
         expand=1,
         K=4,
+        # ── DiM-style persistent in-context condition prefix (off by default) ──
+        #   in_context_len=0 → baseline (adaLN-Zero only), byte-for-byte.
+        #   Prefix tokens are prepended ONCE at block `in_context_start`, pinned
+        #   at the front, scanned in all 4 SS2D directions leading every scan,
+        #   updated in-place each block (persist & update, like DiM), and
+        #   stripped once after the final block.
+        in_context_len: int = 0,
+        in_context_start: int = 0,
+        in_context_content: str = "time_class",   # "time_class" | "class"
     ):
         super().__init__()
         self.in_channels  = in_channels
@@ -274,6 +316,27 @@ class JiTVMamba(nn.Module):
         self.hidden_size  = hidden_size
         self.input_size   = input_size
         self.num_classes  = num_classes
+        self.in_context_len     = in_context_len
+        self.in_context_start   = in_context_start
+        self.in_context_content = in_context_content
+
+        # Learnable positional slots for the prefix tokens (DiM additional_embed).
+        if in_context_len > 0:
+            if in_context_content == "time_class":
+                assert in_context_len in (2, 4), (
+                    "in_context_content='time_class' expects in_context_len 2 "
+                    "([t,y]) or 4 ([t,y,y,t]); got %d" % in_context_len
+                )
+            elif in_context_content == "class":
+                assert in_context_len >= 1
+            else:
+                raise ValueError(
+                    "Unknown in_context_content=%r (use 'time_class' or 'class')"
+                    % in_context_content
+                )
+            self.incontext_pos_embed = nn.Parameter(
+                torch.zeros(1, in_context_len, hidden_size)
+            )
 
         # Spatial grid size (used by SS2D mixers)
         self.grid_size = input_size // patch_size
@@ -349,6 +412,21 @@ class JiTVMamba(nn.Module):
         x = torch.einsum("nhwpqc->nchpwq", x)
         return x.reshape(x.shape[0], c, h * p, h * p)
 
+    def _build_prefix(self, t_emb, y_emb):
+        """Build the DiM-style condition prefix (B, in_context_len, D).
+
+        content="time_class":  len 2 → [t, y];  len 4 → [t, y, y, t]  (DiM mirror)
+        content="class":       len n → [y] * n  (JiT Table 9 / DiS style, K-sweep)
+        A learnable positional slot is added per token (DiM additional_embed).
+        """
+        n = self.in_context_len
+        if self.in_context_content == "time_class":
+            toks = [t_emb, y_emb] if n == 2 else [t_emb, y_emb, y_emb, t_emb]
+        else:  # "class"
+            toks = [y_emb] * n
+        ctx = torch.stack(toks, dim=1)                 # (B, n, D)
+        return ctx + self.incontext_pos_embed          # learnable slots
+
     def forward(self, x, t, y):
         """x: (B, C, H, W) | t: (B,) | y: (B,)  → (B, C, H, W)"""
         t_emb = self.t_embedder(t)
@@ -359,8 +437,19 @@ class JiTVMamba(nn.Module):
         x = x + self.pos_embed
 
         H = W = self.grid_size
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            # DiM: prepend the condition prefix ONCE, then let it persist &
+            # update through the remaining blocks (each SS2D mixer re-injects
+            # it into every scan direction and returns it updated in-place).
+            if self.in_context_len > 0 and i == self.in_context_start:
+                ctx = self._build_prefix(t_emb, y_emb)
+                x = torch.cat([ctx, x], dim=1)         # (B, in_context_len + L, D)
             x = block(x, c, H, W)
+
+        # Strip the prefix once, after the final block.
+        if self.in_context_len > 0:
+            x = x[:, self.in_context_len:, :]
 
         x = self.final_layer(x, c)
         return self.unpatchify(x)
+

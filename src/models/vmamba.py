@@ -77,6 +77,7 @@ class SS2D(nn.Module):
         dt_init_floor: float = 1e-4,
         K: int = 4,
         proj_drop: float = 0.0,
+        state_init: str = "none",     # "none" | "dimsum" | "learned"
     ):
         super().__init__()
         self.d_model = d_model
@@ -137,9 +138,39 @@ class SS2D(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        # ── 5. DiMSUM-style state-init conditioning (off by default) ──
+        # Realized as ONE virtual write position prepended to every scan
+        # direction with condition-derived input u0 = W_u(c), write
+        # direction B0, pre-softplus step dt0, and C0 = 0 (output
+        # stripped) — algebraically EXACT h_{-1} initialization under
+        # Mamba's discretization:  h_{-1} = softplus(dt0 + dt_bias) · B0 ⊗ u0.
+        # Verified against selective_scan_ref in tests/test_stateinit_equivalence.py.
+        #
+        #   "dimsum":  paper-literal h_{-1}[d, n] = W_u(c)[d]  in every
+        #              direction (B0 ≡ 1_N; dt0 chosen at runtime so the
+        #              effective Δ0 is exactly 1 — see forward()).
+        #   "learned": per-direction learnable B0 (K, N) and dt0 (K, d_inner);
+        #              strict superset of "dimsum".
+        assert state_init in ("none", "dimsum", "learned"), state_init
+        self.state_init = state_init
+        if state_init != "none":
+            # zero-initialized in JiTVMamba.initialize_weights (adaLN-Zero
+            # discipline: h_{-1} = 0 at init → exact baseline at step 0).
+            self.cond_u_proj = nn.Linear(d_model, self.d_inner, bias=False)
+            if state_init == "learned":
+                self.B0  = nn.Parameter(torch.ones(K, d_state))
+                self.dt0 = nn.Parameter(torch.zeros(K, self.d_inner))
+            else:  # "dimsum": fixed all-ones write direction (buffer, not trained)
+                self.register_buffer("B0", torch.ones(K, d_state))
+
+    def forward(self, x: torch.Tensor, H: int, W: int,
+                cond: torch.Tensor = None) -> torch.Tensor:
         """
         x: (B, L_in, D) where L_in == extra_len + H*W, extra_len >= 0.
+        cond: (B, D) adaLN condition vector c = t_emb + y_emb; consumed ONLY
+              when state_init != "none" (DiMSUM-style scan-state init, fresh
+              per block). Ignored otherwise — with state_init == "none" this
+              forward is byte-for-byte the previous implementation.
 
         DiM-style persistent condition prefix (extra_len > 0):
           The leading `extra_len` positions are condition tokens. They skip the
@@ -186,12 +217,7 @@ class SS2D(nn.Module):
             seed = seed.expand(B, K, d_inner, extra_len).to(xs.dtype)
             xs = torch.cat([seed, xs], dim=-1)                  # (B, K, d_inner, extra_len+HW)
 
-        L = xs.shape[-1]                                        # extra_len + HW
-
-        # ── 4. STACKED selective scan: one CUDA launch over K*d_inner ─
-        xs_flat = xs.reshape(B, K * d_inner, L)
-
-        # Per-direction x_proj (also covers the prepended condition tokens):
+        # ── 4. Per-direction x_proj (also covers the prepended condition tokens):
         # xs (B,K,d_inner,L) × x_proj_weight (K,dt_rank+2N,d_inner) → (B,K,dt_rank+2N,L)
         x_dbl = torch.einsum("bkdl,kod->bkol", xs, self.x_proj_weight)
 
@@ -200,6 +226,44 @@ class SS2D(nn.Module):
         )
         dt = torch.einsum("bkrl,kdr->bkdl", dt_r, self.dt_projs_weight)
 
+        # ── 4b. State-init: prepend ONE virtual write position per direction ─
+        # Unlike the in-context prefix (3b), the virtual position does NOT go
+        # through x_proj: its Δ/B come from dedicated (condition-derived)
+        # parameters and its C is zero, so it contributes ONLY through the
+        # recurrent state — a pure h_{-1} injection (DiMSUM Conditional Mamba).
+        v = 0
+        if self.state_init != "none" and cond is not None:
+            assert extra_len == 0, (
+                "state_init and the in-context prefix are separate arms; "
+                "run them one at a time (in_context_len must be 0)."
+            )
+            v = 1
+            u0 = self.cond_u_proj(cond)                       # (B, d_inner)
+            u0k = u0[:, None, :].expand(B, K, d_inner)        # shared across directions
+            if self.state_init == "dimsum":
+                # Paper-literal: h_{-1}[d,n] = W_u(c)[d] in EVERY direction.
+                # The kernel adds dt_projs_bias to all positions, so choose
+                # dt0 = softplus^{-1}(1) - bias ⇒ effective Δ0 ≡ 1 exactly
+                # (per direction, regardless of the learned bias value; the
+                # bias cancels, so no gradient leaks into it through this path).
+                dt0 = (math.log(math.e - 1.0) - self.dt_projs_bias)   # (K, d_inner)
+            else:  # "learned": free pre-softplus Δ0 (effective softplus(dt0+bias))
+                dt0 = self.dt0                                        # (K, d_inner)
+            xs = torch.cat(
+                [u0k.unsqueeze(-1).to(xs.dtype), xs], dim=-1)         # (B,K,d,1+L)
+            dt = torch.cat(
+                [dt0[None, :, :, None].expand(B, K, d_inner, 1).to(dt.dtype), dt],
+                dim=-1)
+            B_ssm = torch.cat(
+                [self.B0[None, :, :, None].expand(B, K, d_state, 1).to(B_ssm.dtype),
+                 B_ssm], dim=-1)
+            C_ssm = torch.cat(
+                [C_ssm.new_zeros(B, K, d_state, 1), C_ssm], dim=-1)   # C0 = 0
+
+        L = xs.shape[-1]                                        # v + extra_len + HW
+
+        # ── 4c. STACKED selective scan: one CUDA launch over K*d_inner ─
+        xs_flat    = xs.reshape(B, K * d_inner, L)
         dt_flat    = dt.contiguous().view(B, K * d_inner, L)
         B_ssm_flat = B_ssm.contiguous().view(B, K, d_state, L)
         C_ssm_flat = C_ssm.contiguous().view(B, K, d_state, L)
@@ -222,7 +286,12 @@ class SS2D(nn.Module):
             return_last_state=False,
         )                                                  # (B, K*d_inner, L)
 
-        ys = y.view(B, K, d_inner, L)                     # (B, K, d_inner, extra_len+HW)
+        ys = y.view(B, K, d_inner, L)                     # (B, K, d_inner, v+extra_len+HW)
+
+        # Strip the virtual write position: its output (C0·h0 + D·u0 = D·u0)
+        # is discarded — the condition acted purely through the entering state.
+        if v:
+            ys = ys[:, :, :, v:]                          # (B, K, d_inner, extra_len+HW)
 
         # ── 5. Merge. Grid: cross_merge (un-permute + sum). ──────────
         #        Extras: plain sum over directions (cross_merge analog; no
@@ -250,14 +319,14 @@ class JiTBlock(nn.Module):
     """JiT block with adaLN-Zero conditioning, SS2D mixer, and SwiGLU FFN."""
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=16, d_conv=3, expand=1, K=4,
-                 attn_drop=0.0, proj_drop=0.0):
+                 attn_drop=0.0, proj_drop=0.0, state_init="none"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.mixer = SS2D(
             d_model=hidden_size,
             d_state=d_state, d_conv=d_conv, expand=expand, K=K,
-            proj_drop=proj_drop,
+            proj_drop=proj_drop, state_init=state_init,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -271,7 +340,7 @@ class JiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa.unsqueeze(1) * self.mixer(
-            modulate(self.norm1(x), shift_msa, scale_msa), H, W)
+            modulate(self.norm1(x), shift_msa, scale_msa), H, W, cond=c)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
             modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
@@ -308,6 +377,11 @@ class JiTVMamba(nn.Module):
         in_context_len: int = 0,
         in_context_start: int = 0,
         in_context_content: str = "time_class",   # "time_class" | "class"
+        # ── DiMSUM-style scan-state-init conditioning (off by default) ──
+        #   "none"    → baseline / in-context arms (unchanged, byte-for-byte)
+        #   "dimsum"  → paper-literal h_{-1} = W_u(c) per direction, per block
+        #   "learned" → + learnable per-direction write direction B0 and Δ0
+        state_init: str = "none",
     ):
         super().__init__()
         self.in_channels  = in_channels
@@ -319,6 +393,11 @@ class JiTVMamba(nn.Module):
         self.in_context_len     = in_context_len
         self.in_context_start   = in_context_start
         self.in_context_content = in_context_content
+        self.state_init         = state_init
+        assert not (state_init != "none" and in_context_len > 0), (
+            "state_init and the in-context prefix are separate conditioning "
+            "arms — enable at most one per run."
+        )
 
         # Learnable positional slots for the prefix tokens (DiM additional_embed).
         if in_context_len > 0:
@@ -360,6 +439,7 @@ class JiTVMamba(nn.Module):
                 d_state=d_state, d_conv=d_conv, expand=expand, K=K,
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
+                state_init=state_init,
             )
             for i in range(depth)
         ])
@@ -392,6 +472,13 @@ class JiTVMamba(nn.Module):
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # State-init conditioning: re-zero the write-content projection
+        # (the _basic_init xavier pass above touched it). h_{-1} = 0 at
+        # init → the model starts as the exact baseline (adaLN-Zero discipline).
+        if self.state_init != "none":
+            for block in self.blocks:
+                nn.init.constant_(block.mixer.cond_u_proj.weight, 0)
 
         # adaLN-Zero
         for block in self.blocks:

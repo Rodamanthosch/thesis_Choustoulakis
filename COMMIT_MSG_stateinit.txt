@@ -1,0 +1,29 @@
+Add DiMSUM-style scan-state-init conditioning arm to JiT-S2-VMamba
+
+- SS2D: state_init={none|dimsum|learned} via ONE virtual write position
+  per CrossScan direction (u0 = W_u(c), dedicated B0/dt0, C0 = 0, output
+  stripped) -- algebraically exact h_{-1} initialization under Mamba's
+  discretization, proven vs selective_scan_ref at machine epsilon
+  (tests/test_stateinit_equivalence.py).
+  * dimsum:  paper-literal h_{-1} = W_u(c) per direction (B0 = 1_N,
+    effective Delta0 == 1 exactly; the shared dt bias cancels).
+  * learned: + learnable per-direction B0 (K,N) and dt0 (K,d_inner).
+  Injected FRESH per block from c = t_emb + y_emb (same vector as adaLN),
+  matching DiMSUM's semantics. W_u zero-init -> exact baseline at step 0.
+  NOTE: the released DiMSUM kernel is functionally inert (cond_ptr
+  commented out; cond tensor reused as an overwritten output buffer);
+  this implements the paper's equation, not their code.
+
+- Conditioning arms are separated and mutually exclusive by assert:
+  adaLN-only / in-context prefix / state-init, selected by config.
+  state_init=none is bit-identical to the previous model (verified for
+  baseline and in-context paths; state_dict keys unchanged).
+
+- scripts/evaluate.py: wire state_init AND the deferred in-context fix
+  (in_context_len/start/content were missing from its build_model copy).
+
+- configs: tiny_imagenet stateinit-dimsum / stateinit-learned arms.
+- tests: equivalence proof + model-level guards (bit-identity, gradient
+  flow, dimsum exactness, arm exclusivity).
+- scripts/check_stateinit_cuda.py: CUDA-vs-reference kernel check for the
+  first Kaggle session.

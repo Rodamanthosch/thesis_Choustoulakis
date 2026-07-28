@@ -1,0 +1,87 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D) on Tiny-ImageNet 64x64 — STATE-INIT, paper-literal (DiMSUM)
+# ------------------------------------------------------------
+# DiMSUM's Conditional Mamba (arXiv:2411.04168) ported to the 4-direction SS2D
+# scan: the scan state entering the first grid token of EVERY direction is
+# initialized from the condition,  h_{-1}[d, n] = W_u(c)[d],  c = t_emb + y_emb
+# (the same vector as adaLN-Zero), injected FRESH AT EVERY BLOCK — exactly the
+# paper's semantics. NOTE: the released DiMSUM kernel is functionally inert
+# (cond_ptr commented out at the C++ level; the cond tensor is reused as an
+# output buffer and fully overwritten), so this arm implements the PAPER'S
+# EQUATION, not their code.
+#
+# Realization: one virtual write position per direction with u0 = W_u(c),
+# B0 = 1_N, effective Δ0 = 1 (dt0 chosen so softplus cancels the shared dt
+# bias), C0 = 0, output stripped. Proven algebraically exact vs
+# selective_scan_ref in tests/test_stateinit_equivalence.py (machine epsilon).
+#
+# Separation of conditioning mechanisms (one arm per run):
+#   adaLN-Zero      : always on (shared scaffold, all arms)
+#   in-context      : in_context_len > 0, state_init: none
+#   state-init      : in_context_len: 0,  state_init: dimsum | learned
+# Combining prefix + state_init raises an assert by design.
+#
+# Params: +W_u (hidden^2 = ~148K) per block, ~1.8M total at S/12 — between the
+# incontext K=8 and K=16 arms. Scan length L -> L+1 (65 vs 64): negligible.
+# W_u is ZERO-INITIALIZED -> h_{-1}=0 at step 0 -> exact baseline at init.
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-stateinit-dimsum
+  model: vmamba
+  dataset: imagenet
+  data_dir: ./data/tiny-imagenet-200
+  seed: 42
+
+model:
+  input_size: 64
+  patch_size: 8
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4
+  # -- conditioning arm: DiMSUM scan-state init (paper-literal) --
+  in_context_len: 0                 # in-context prefix OFF (separate arm)
+  state_init: dimsum                # none | dimsum | learned
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-stateinit-dimsum

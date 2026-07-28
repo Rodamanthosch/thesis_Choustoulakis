@@ -123,6 +123,7 @@ def build_model(cfg):
             in_context_start=m.get("in_context_start", 0),
             in_context_content=m.get("in_context_content", "time_class"),
             state_init=m.get("state_init", "none"),
+            ssc=m.get("ssc", "none"),
         )
     else:
         raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba")

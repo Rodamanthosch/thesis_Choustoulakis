@@ -78,6 +78,7 @@ class SS2D(nn.Module):
         K: int = 4,
         proj_drop: float = 0.0,
         state_init: str = "none",     # "none" | "dimsum" | "learned"
+        ssc: str = "none",            # "none" | "bc" | "abc"  (DiM-2 SSC)
     ):
         super().__init__()
         self.d_model = d_model
@@ -163,6 +164,32 @@ class SS2D(nn.Module):
             else:  # "dimsum": fixed all-ones write direction (buffer, not trained)
                 self.register_buffer("B0", torch.ones(K, d_state))
 
+        # ── 6. DiM-2 Semi-Separable Conditioning (off by default) ─────
+        # SSC (DiM-2, technical report 2026) modulates the SSM maps directly:
+        #   B' = B + b0 + W_B c,   C' = C + c0 + W_C c        ["bc" and "abc"]
+        #   decay gated per direction by s = sigmoid(<w_A^k, c> + g0^k)  ["abc"]
+        # Parameterization follows Mamba-3's validated B/C-bias design
+        # (arXiv 2603.15569, Table 10): BOTH biases, static parts b0/c0
+        # ones-init (positive init matters; B-bias alone hurts). The
+        # condition parts W_B/W_C are ZERO-INIT (adaLN-Zero discipline), so
+        # at init the "bc" arm equals a Mamba-3-style static-bias model.
+        # A-gating is realized EXACTLY on the stock kernel via the identity
+        #   exp((s*Delta)A) = exp(Delta*A*s),  (s*Delta)(B'/s)u = Delta B'u,
+        # i.e. scale Delta by s and divide B' by s, calling the kernel with
+        # delta_softplus=False (softplus applied here in fp32 beforehand).
+        # g0 init 4.0 -> s ~= 0.982 at init (near-baseline decay); s clamped
+        # >= 0.1 so B'/s <= 10x (amp-safe). Verified in tests/test_ssc_equivalence.py.
+        assert ssc in ("none", "bc", "abc"), ssc
+        self.ssc = ssc
+        if ssc != "none":
+            self.bias_B = nn.Parameter(torch.ones(K, d_state))       # static, Mamba-3 style
+            self.bias_C = nn.Parameter(torch.ones(K, d_state))
+            self.cond_B_proj = nn.Linear(d_model, K * d_state, bias=False)  # zero-init (see initialize_weights)
+            self.cond_C_proj = nn.Linear(d_model, K * d_state, bias=False)
+            if ssc == "abc":
+                self.gate_A_w = nn.Parameter(torch.zeros(K, d_model))
+                self.gate_A_b = nn.Parameter(torch.full((K,), 4.0))
+
     def forward(self, x: torch.Tensor, H: int, W: int,
                 cond: torch.Tensor = None) -> torch.Tensor:
         """
@@ -226,6 +253,28 @@ class SS2D(nn.Module):
         )
         dt = torch.einsum("bkrl,kdr->bkdl", dt_r, self.dt_projs_weight)
 
+        # ── 4a. DiM-2 SSC: condition-modulated B/C maps (+ A-gate for "abc") ─
+        ssc_gate = None
+        if self.ssc != "none" and cond is not None:
+            assert extra_len == 0 and self.state_init == "none", (
+                "ssc, state_init and the in-context prefix are separate "
+                "conditioning arms; enable at most one per run."
+            )
+            B_ssm = B_ssm + (
+                self.bias_B[None, :, :, None]
+                + self.cond_B_proj(cond).view(B, K, d_state)[..., None]
+            ).to(B_ssm.dtype)
+            C_ssm = C_ssm + (
+                self.bias_C[None, :, :, None]
+                + self.cond_C_proj(cond).view(B, K, d_state)[..., None]
+            ).to(C_ssm.dtype)
+            if self.ssc == "abc":
+                # per-direction scalar decay gate s in [0.1, 1)  (B, K)
+                ssc_gate = torch.sigmoid(
+                    torch.einsum("bd,kd->bk", cond.float(), self.gate_A_w)
+                    + self.gate_A_b
+                ).clamp(min=0.1)
+
         # ── 4b. State-init: prepend ONE virtual write position per direction ─
         # Unlike the in-context prefix (3b), the virtual position does NOT go
         # through x_proj: its Δ/B come from dedicated (condition-derived)
@@ -273,18 +322,41 @@ class SS2D(nn.Module):
         D_param    = self.Ds.float().view(K * d_inner)
         delta_bias = self.dt_projs_bias.float().view(K * d_inner)
 
-        y = selective_scan_fn(
-            xs_flat,                                      # u: (B, K*d_inner, L)
-            dt_flat,                                      # delta: (B, K*d_inner, L)
-            A,                                            # (K*d_inner, d_state)
-            B_ssm_flat,                                   # (B, K, d_state, L)
-            C_ssm_flat,                                   # (B, K, d_state, L)
-            D_param,                                      # (K*d_inner,)
-            z=None,
-            delta_bias=delta_bias,                        # (K*d_inner,)
-            delta_softplus=True,
-            return_last_state=False,
-        )                                                  # (B, K*d_inner, L)
+        if ssc_gate is not None:
+            # EXACT per-sample A-gating on the stock kernel via the identity
+            #   exp((s·Δ)·A) = exp(Δ·A·s)      [decay gated]
+            #   (s·Δ)·(B'/s)·u = Δ·B'·u        [write unchanged]
+            # softplus applied here in fp32 (as the kernel would internally),
+            # then the kernel is called with delta_softplus=False.
+            dt_eff = F.softplus(dt_flat.float() + delta_bias[None, :, None])
+            g = ssc_gate.repeat_interleave(d_inner, dim=1)[..., None]  # (B, K*d_inner, 1)
+            dt_scan = (dt_eff * g).to(dt_flat.dtype)
+            B_scan = (B_ssm_flat.float() / ssc_gate[:, :, None, None]).to(B_ssm_flat.dtype)
+            y = selective_scan_fn(
+                xs_flat,                                  # u: (B, K*d_inner, L)
+                dt_scan,                                  # gated, POST-softplus
+                A,
+                B_scan,                                   # (B, K, d_state, L)
+                C_ssm_flat,
+                D_param,
+                z=None,
+                delta_bias=None,
+                delta_softplus=False,
+                return_last_state=False,
+            )                                              # (B, K*d_inner, L)
+        else:
+            y = selective_scan_fn(
+                xs_flat,                                      # u: (B, K*d_inner, L)
+                dt_flat,                                      # delta: (B, K*d_inner, L)
+                A,                                            # (K*d_inner, d_state)
+                B_ssm_flat,                                   # (B, K, d_state, L)
+                C_ssm_flat,                                   # (B, K, d_state, L)
+                D_param,                                      # (K*d_inner,)
+                z=None,
+                delta_bias=delta_bias,                        # (K*d_inner,)
+                delta_softplus=True,
+                return_last_state=False,
+            )                                                  # (B, K*d_inner, L)
 
         ys = y.view(B, K, d_inner, L)                     # (B, K, d_inner, v+extra_len+HW)
 
@@ -319,14 +391,14 @@ class JiTBlock(nn.Module):
     """JiT block with adaLN-Zero conditioning, SS2D mixer, and SwiGLU FFN."""
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=16, d_conv=3, expand=1, K=4,
-                 attn_drop=0.0, proj_drop=0.0, state_init="none"):
+                 attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.mixer = SS2D(
             d_model=hidden_size,
             d_state=d_state, d_conv=d_conv, expand=expand, K=K,
-            proj_drop=proj_drop, state_init=state_init,
+            proj_drop=proj_drop, state_init=state_init, ssc=ssc,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -382,6 +454,13 @@ class JiTVMamba(nn.Module):
         #   "dimsum"  → paper-literal h_{-1} = W_u(c) per direction, per block
         #   "learned" → + learnable per-direction write direction B0 and Δ0
         state_init: str = "none",
+        # ── DiM-2 Semi-Separable Conditioning (off by default) ──
+        #   "none" → baseline / other arms (unchanged, byte-for-byte)
+        #   "bc"   → B' = B + b0 + W_B c, C' = C + c0 + W_C c
+        #            (Mamba-3 static biases + DiM-2 condition biases)
+        #   "abc"  → "bc" + per-direction sigmoid decay gate on the
+        #            effective A (exact via the Δ·s / B÷s identity)
+        ssc: str = "none",
     ):
         super().__init__()
         self.in_channels  = in_channels
@@ -394,9 +473,11 @@ class JiTVMamba(nn.Module):
         self.in_context_start   = in_context_start
         self.in_context_content = in_context_content
         self.state_init         = state_init
-        assert not (state_init != "none" and in_context_len > 0), (
-            "state_init and the in-context prefix are separate conditioning "
-            "arms — enable at most one per run."
+        self.ssc                = ssc
+        n_arms = (state_init != "none") + (in_context_len > 0) + (ssc != "none")
+        assert n_arms <= 1, (
+            "state_init, ssc, and the in-context prefix are separate "
+            "conditioning arms — enable at most one per run."
         )
 
         # Learnable positional slots for the prefix tokens (DiM additional_embed).
@@ -439,7 +520,7 @@ class JiTVMamba(nn.Module):
                 d_state=d_state, d_conv=d_conv, expand=expand, K=K,
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
-                state_init=state_init,
+                state_init=state_init, ssc=ssc,
             )
             for i in range(depth)
         ])
@@ -479,6 +560,15 @@ class JiTVMamba(nn.Module):
         if self.state_init != "none":
             for block in self.blocks:
                 nn.init.constant_(block.mixer.cond_u_proj.weight, 0)
+
+        # SSC: re-zero the condition projections (adaLN-Zero discipline); the
+        # static biases stay at their ones-init (Mamba-3 Table 10: positive
+        # init matters), so at init the "bc"/"abc" arms equal a Mamba-3-style
+        # static-bias model with no condition contribution.
+        if self.ssc != "none":
+            for block in self.blocks:
+                nn.init.constant_(block.mixer.cond_B_proj.weight, 0)
+                nn.init.constant_(block.mixer.cond_C_proj.weight, 0)
 
         # adaLN-Zero
         for block in self.blocks:

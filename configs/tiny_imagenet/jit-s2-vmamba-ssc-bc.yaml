@@ -1,0 +1,80 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D) on Tiny-ImageNet 64x64 — SSC-BC (DiM-2 B/C conditioning)
+# ------------------------------------------------------------
+# DiM-2's Semi-Separable Conditioning (Abe, technical report 2026), B/C part,
+# on the 4-direction SS2D scan:  B' = B + b0 + W_B c,  C' = C + c0 + W_C c,
+# c = t_emb + y_emb (same vector as adaLN), fresh per block, per direction.
+# Every position writes along / reads from a condition-shifted state direction
+# — the DISTRIBUTED counterpart of the state-init arm's boundary-only write.
+#
+# Parameterization follows Mamba-3's validated B/C-bias design (arXiv
+# 2603.15569, Table 10): BOTH biases, static parts ones-init; condition
+# projections W_B/W_C zero-init (adaLN-Zero). At W_B=W_C=0 this arm IS a
+# Mamba-3-style static-bias model; at b0=c0=0 it is DiM-2's SSC-BC exactly.
+# DiM-2 is an unevaluated protocol paper: this arm is, to our knowledge, the
+# first empirical test of SSC.
+#
+# Arms are mutually exclusive (assert): adaLN-only / in-context / state-init /
+# ssc — selected purely by config. Params: ~+0.6M (2x Linear(384->64)/block).
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-ssc-bc
+  model: vmamba
+  dataset: imagenet
+  data_dir: ./data/tiny-imagenet-200
+  seed: 42
+
+model:
+  input_size: 64
+  patch_size: 8
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4
+  # -- conditioning arm: DiMSUM scan-state init (paper-literal) --
+  in_context_len: 0                 # in-context prefix OFF (separate arm)
+  state_init: none                  # state-init OFF (separate arm)
+  ssc: bc                           # none | bc | abc
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-ssc-bc

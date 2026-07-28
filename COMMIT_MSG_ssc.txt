@@ -1,0 +1,26 @@
+Add DiM-2 Semi-Separable Conditioning (SSC) arm to JiT-S2-VMamba
+
+- SS2D: ssc={none|bc|abc}, fresh per block from c = t_emb + y_emb.
+  * bc:  B' = B + b0 + W_B c, C' = C + c0 + W_C c per direction. Static
+    biases ones-init per Mamba-3 (arXiv 2603.15569, Table 10: both biases,
+    positive init); condition projections zero-init (adaLN-Zero) — at init
+    the arm equals a Mamba-3-style static-bias model; at b0=c0=0 it is
+    DiM-2's SSC-BC exactly. To our knowledge the first empirical test of
+    SSC (DiM-2 is an unevaluated protocol report).
+  * abc: + per-direction decay gate s = sigmoid(<w_A,c>+g0), g0 init 4.0
+    (s~0.982 at init), s clamped >= 0.1 (amp-safe). Realized EXACTLY on the
+    stock selective_scan_fn via exp((s*Delta)A) = exp(Delta*A*s) with B'/s
+    and delta_softplus=False (softplus in fp32 beforehand) — proven at
+    machine epsilon in tests/test_ssc_equivalence.py, plus fp32 cross-check
+    against mamba_ssm's reference. Per-direction scalar gate is the
+    faithful Mamba-1-matrix-A analog of DiM-2's scalar-per-head gating.
+
+- Four conditioning arms now selectable purely by config and mutually
+  exclusive by assert: adaLN-only / in-context / state-init / ssc.
+  ssc=none is bit-identical to main for ALL existing arms (verified);
+  state_dict keys unchanged.
+
+- configs: tiny_imagenet ssc-bc / ssc-abc arms (same CFG + recipe).
+- tests: gate-identity + s=1 consistency + bias-linearity proofs;
+  model-level guards (bit-identity, init semantics, grads, gate value,
+  exclusivity).

@@ -1,0 +1,36 @@
+Add ssc="static" (Mamba-3 bias-only CONTROL) + Tiny-ImageNet SSC notebooks
+
+- SS2D: ssc="static" — ONLY the ones-init per-direction static biases,
+  B' = B + b0, C' = C + c0 (Mamba-3, arXiv 2603.15569, Table 10). NO
+  condition path through SSC (no W_B/W_C created); class/timestep reach
+  the model only via adaLN-Zero. Deconfounds the bc arm: bc bundles
+  (a) the static-bias effect and (b) the DiM-2 condition-bias effect —
+  "static" is exactly what bc equals at step 0 (zero-init condition
+  projections), trained to convergence with the condition path never
+  opened. Ladder: baseline -> static -> bc -> abc, one mechanism per rung.
+
+- Realization: 5 minimal edits to src/models/vmamba.py (assert, param
+  split, forward accumulator, docs, init guard). none/bc/abc PROVEN
+  byte-identical pre/post patch (reference-scan transplant test);
+  state_dict keys of existing arms unchanged. Params: +2*K*d_state per
+  block = +1,536 at S/12 (vs +0.6M for bc). Scan length unchanged.
+
+- scripts/install_ssc_static.sh: idempotent installer (backup + anchored
+  edits + py_compile with restore-on-failure + config write) for
+  checkouts that predate this commit — the static notebook embeds the
+  same patch and no-ops once this is on main.
+
+- configs: tiny_imagenet ssc-static (same recipe as bc/abc; arm only).
+
+- tests/test_ssc_static_cpu.py: CPU-only proof (mamba_ssm stubbed with a
+  reference scan): static == bc at init EXACTLY (weight transplant, since
+  independent seeding cannot align params — bc's extra Linears shift the
+  init RNG stream); static != none; abc != bc at init (gate ~0.982);
+  exact param deltas; state_dict subset; exclusivity asserts.
+
+- notebooks/tiny_imagenet: the 3 SSC Kaggle notebooks (static/bc/abc) in
+  the stateinit-notebook layout (env/clone/verify/data/settings/train/
+  eval). Verify cells run the ssc tests with PYTHONPATH=. — required on
+  Kaggle: without it "from src.models..." fails and the try/except
+  misreports it as missing mamba_ssm (known issue; bare "!python tests/"
+  invocations silently skip).

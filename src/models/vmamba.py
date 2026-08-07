@@ -78,7 +78,7 @@ class SS2D(nn.Module):
         K: int = 4,
         proj_drop: float = 0.0,
         state_init: str = "none",     # "none" | "dimsum" | "learned"
-        ssc: str = "none",            # "none" | "bc" | "abc"  (DiM-2 SSC)
+        ssc: str = "none",            # "none" | "static" | "bc" | "abc"  (DiM-2 SSC; "static" = bias-only control)
     ):
         super().__init__()
         self.d_model = d_model
@@ -179,11 +179,12 @@ class SS2D(nn.Module):
         # delta_softplus=False (softplus applied here in fp32 beforehand).
         # g0 init 4.0 -> s ~= 0.982 at init (near-baseline decay); s clamped
         # >= 0.1 so B'/s <= 10x (amp-safe). Verified in tests/test_ssc_equivalence.py.
-        assert ssc in ("none", "bc", "abc"), ssc
+        assert ssc in ("none", "static", "bc", "abc"), ssc
         self.ssc = ssc
         if ssc != "none":
             self.bias_B = nn.Parameter(torch.ones(K, d_state))       # static, Mamba-3 style
             self.bias_C = nn.Parameter(torch.ones(K, d_state))
+        if ssc in ("bc", "abc"):
             self.cond_B_proj = nn.Linear(d_model, K * d_state, bias=False)  # zero-init (see initialize_weights)
             self.cond_C_proj = nn.Linear(d_model, K * d_state, bias=False)
             if ssc == "abc":
@@ -255,19 +256,18 @@ class SS2D(nn.Module):
 
         # ── 4a. DiM-2 SSC: condition-modulated B/C maps (+ A-gate for "abc") ─
         ssc_gate = None
-        if self.ssc != "none" and cond is not None:
+        if self.ssc != "none" and (self.ssc == "static" or cond is not None):
             assert extra_len == 0 and self.state_init == "none", (
                 "ssc, state_init and the in-context prefix are separate "
                 "conditioning arms; enable at most one per run."
             )
-            B_ssm = B_ssm + (
-                self.bias_B[None, :, :, None]
-                + self.cond_B_proj(cond).view(B, K, d_state)[..., None]
-            ).to(B_ssm.dtype)
-            C_ssm = C_ssm + (
-                self.bias_C[None, :, :, None]
-                + self.cond_C_proj(cond).view(B, K, d_state)[..., None]
-            ).to(C_ssm.dtype)
+            add_B = self.bias_B[None, :, :, None]
+            add_C = self.bias_C[None, :, :, None]
+            if self.ssc in ("bc", "abc"):
+                add_B = add_B + self.cond_B_proj(cond).view(B, K, d_state)[..., None]
+                add_C = add_C + self.cond_C_proj(cond).view(B, K, d_state)[..., None]
+            B_ssm = B_ssm + add_B.to(B_ssm.dtype)
+            C_ssm = C_ssm + add_C.to(C_ssm.dtype)
             if self.ssc == "abc":
                 # per-direction scalar decay gate s in [0.1, 1)  (B, K)
                 ssc_gate = torch.sigmoid(
@@ -455,7 +455,10 @@ class JiTVMamba(nn.Module):
         #   "learned" → + learnable per-direction write direction B0 and Δ0
         state_init: str = "none",
         # ── DiM-2 Semi-Separable Conditioning (off by default) ──
-        #   "none" → baseline / other arms (unchanged, byte-for-byte)
+        #   "none"   → baseline / other arms (unchanged, byte-for-byte)
+        #   "static" → B' = B + b0, C' = C + c0 ONLY (Mamba-3 bias control;
+        #              equals "bc" at step 0, no condition path — isolates
+        #              the static-bias effect from the conditioning effect)
         #   "bc"   → B' = B + b0 + W_B c, C' = C + c0 + W_C c
         #            (Mamba-3 static biases + DiM-2 condition biases)
         #   "abc"  → "bc" + per-direction sigmoid decay gate on the
@@ -565,7 +568,7 @@ class JiTVMamba(nn.Module):
         # static biases stay at their ones-init (Mamba-3 Table 10: positive
         # init matters), so at init the "bc"/"abc" arms equal a Mamba-3-style
         # static-bias model with no condition contribution.
-        if self.ssc != "none":
+        if self.ssc in ("bc", "abc"):
             for block in self.blocks:
                 nn.init.constant_(block.mixer.cond_B_proj.weight, 0)
                 nn.init.constant_(block.mixer.cond_C_proj.weight, 0)

@@ -66,28 +66,52 @@ def _recording(u, *a, **kw):
 
 
 CONFIGS = [
-    ("configs/tiny_imagenet/jit-s2-vmamba-incontext-row-class.yaml", 64 + 8),
-    ("configs/tiny_imagenet/jit-s2-vmamba-incontext-row-timeclass.yaml", 64 + 16),
+    "configs/tiny_imagenet/jit-s2-vmamba-incontext-row-class.yaml",
+    "configs/tiny_imagenet/jit-s2-vmamba-incontext-row-timeclass.yaml",
 ]
+
+
+def runs(lengths):
+    """[64,64,64,64,72,...] -> '64 x4, 72 x8' for a readable one-line report."""
+    out, prev, n = [], None, 0
+    for L in lengths:
+        if L == prev:
+            n += 1
+        else:
+            if prev is not None:
+                out.append(f"{prev} x{n}")
+            prev, n = L, 1
+    out.append(f"{prev} x{n}")
+    return ", ".join(out)
+
 
 vm.selective_scan_fn = _recording
 try:
-    for path, want_L in CONFIGS:
+    for path in CONFIGS:
         cfg = yaml.safe_load(open(path))
+        mc = cfg["model"]
+        n_cls, res = mc["num_classes"], mc["input_size"]
+        # The prefix is injected at block `in_context_start`, so the FIRST
+        # `start` blocks scan the pure grid (L = HW) and the remaining
+        # `depth - start` carry the condition tokens (L = HW + len). One entry
+        # per block, in order.
+        hw = (res // mc["patch_size"]) ** 2
+        start, depth = mc["in_context_start"], mc["depth"]
+        want = [hw] * start + [hw + mc["in_context_len"]] * (depth - start)
+
         m = build_model(cfg).to(dev)
-        n_cls, res = cfg["model"]["num_classes"], cfg["model"]["input_size"]
         x = torch.randn(2, 3, res, res, device=dev)
         SEEN.clear()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = m(x, torch.rand(2, device=dev),
                     torch.randint(0, n_cls, (2,), device=dev))
         out.float().mean().backward()
-        got_L = sorted(set(SEEN))
-        good = (out.shape == x.shape and got_L == [want_L]
+        good = (out.shape == x.shape and SEEN == want
                 and m.incontext_pos_embed.grad is not None)
         ok &= good
-        print(f"2. {os.path.basename(path):<48} out {tuple(out.shape)} "
-              f"scan L {got_L} (want [{want_L}])  {'OK' if good else 'FAIL'}")
+        print(f"2. {os.path.basename(path):<48} out {tuple(out.shape)}  "
+              f"scan L per block: {runs(SEEN)}  (want {runs(want)})  "
+              f"{'OK' if good else 'FAIL'}")
         del m, out
         torch.cuda.empty_cache()
 finally:

@@ -29,6 +29,25 @@ defaults reproduce the adaLN-Zero baseline byte-for-byte.
 `in_context_layout` defaults to `prefix`; `row` requires `in_context_len` to be a
 multiple of `grid_size` (and exactly `2 * grid_size` for `time_class`).
 
+`adaln_cond` is a **modifier of the SSC arm**, not an arm of its own (it does not
+enter the `n_arms` count): it selects which residual branches adaLN still carries
+`(t, y)` into. SSC can only modulate `B`/`C`(/`A`) *inside* the mixer, so
+`mlp` is the honest "SSC replaces adaLN" comparison and `none` additionally
+strips the FFN and the output head.
+
+| `adaln_cond` | mixer branch | FFN branch + `FinalLayer` | S/12 params |
+|---|---|---|---|
+| `full` (default, `true`) | adaLN-Zero | adaLN-Zero | 31.62M (ssc-bc) |
+| `mlp` | zero-init static bias | adaLN-Zero | 26.61M |
+| `none` (`false`) | zero-init static bias | zero-init static bias | 21.01M |
+
+Anything but `full` requires `ssc != "none"` and forbids the in-context prefix.
+`ssc_z_mlp: true` (legal only when `adaln_cond != "full"`) gives SSC DiM-2's
+dedicated `z = MLP(t, c)`; `z` goes to the **SSC path only**, while any surviving
+adaLN keeps consuming the raw `c`. `none` keeps the parameter names the
+notebooks' `install_noadaln.sh` used (`blocks.*.adaLN_bias`,
+`final_layer.adaLN_bias`), so checkpoints from those runs still load.
+
 When adding a new arm, keep the "off" setting byte-identical to the previous
 model and prove it in a CPU test under `tests/` (see
 `tests/test_incontext_row_cpu.py` check A, which transplants weights from

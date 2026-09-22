@@ -90,6 +90,8 @@ def build_model(cfg):
             in_context_layout=m.get("in_context_layout", "prefix"),
             state_init=m.get("state_init", "none"),
             ssc=m.get("ssc", "none"),
+            adaln_cond=m.get("adaln_cond", "full"),
+            ssc_z_mlp=m.get("ssc_z_mlp", False),
         )
     else:
         raise ValueError(f"Unknown model: {arch}")

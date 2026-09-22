@@ -1,0 +1,93 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D) on Tiny-ImageNet 64x64 — SSC-BC with adaLN on the FFN ONLY
+# ------------------------------------------------------------
+# The MIXER-ONLY replacement reading of DiM-2. The `-noadaln` arm removes adaLN
+# from the whole block, but SSC can only modulate B/C(+A) INSIDE the SS2D scan:
+# it can replace the mixer branch's conditioning and nothing else, so that run
+# also left the SwiGLU FFN (and the output head) with no conditioning at all —
+# a handicap DiM-2 does not ask for, and a confound on the measured gap.
+#
+# Here adaln_cond: mlp keeps adaLN-Zero on the FFN branch and on FinalLayer,
+# and turns ONLY the mixer branch's shift/scale/gate into a condition-
+# independent zero-init bias. (t, y) therefore reach the SSM exclusively
+# through SSC, which is the question DiM-2 actually poses:
+#   supplement  → jit-s2-vmamba-ssc-bc.yaml          (adaLN everywhere)
+#   MIXER-only  → this file                             (adaln_cond: mlp)
+#   replacement → jit-s2-vmamba-ssc-bc-noadaln.yaml  (adaln_cond: false)
+#
+# Params ~26.6M vs 31.62M baseline and ~21.0M for -noadaln: the block adaLN
+# Linear(384->2304) becomes Linear(384->1152) + a 1152 static bias (-5.31M),
+# while ssc_z_mlp adds DiM-2's z = MLP(t, c) (+0.30M) and the conditional
+# FinalLayer stays (+0.30M vs -noadaln). Report as a param-mismatched
+# comparison; compute is ~unchanged (adaLN runs once per SAMPLE, not per token).
+#
+# Arms are mutually exclusive (assert): adaLN-only / in-context / state-init /
+# ssc. adaln_cond is a MODIFIER of the ssc arm, not an arm of its own.
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-ssc-bc-ffnadaln
+  model: vmamba
+  dataset: imagenet
+  data_dir: ./data/tiny-imagenet-200
+  seed: 42
+
+model:
+  input_size: 64
+  patch_size: 8
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4
+  # -- conditioning arm: DiMSUM scan-state init (paper-literal) --
+  in_context_len: 0                 # in-context prefix OFF (separate arm)
+  state_init: none                  # state-init OFF (separate arm)
+  ssc: bc                           # none | bc | abc
+  # -- SSC REPLACES adaLN in the MIXER branch only (mixer-only DiM-2) --
+  # "full" (default) = adaLN on both branches; "mlp" = FFN branch + FinalLayer
+  # keep adaLN-Zero, mixer branch becomes a condition-independent zero-init
+  # bias; "none"/false = the -noadaln arm (nothing but SSC is conditional).
+  adaln_cond: mlp                   # full | mlp | none
+  ssc_z_mlp: true                   # DiM-2's dedicated z = MLP(t, c), SSC path only
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-ssc-bc-ffnadaln

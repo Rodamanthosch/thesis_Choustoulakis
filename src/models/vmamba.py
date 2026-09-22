@@ -448,11 +448,20 @@ class SS2D(nn.Module):
 # ── JiT Block (from jit-vmamba-cifar10 Cell 13) ──────────────────────────────
 
 class JiTBlock(nn.Module):
-    """JiT block with adaLN-Zero conditioning, SS2D mixer, and SwiGLU FFN."""
+    """JiT block with adaLN-Zero conditioning, SS2D mixer, and SwiGLU FFN.
+
+    adaln_cond selects WHICH of the two residual branches adaLN still carries
+    (t, y) into — see JiTVMamba's docstring for the arm table:
+      "full" → both branches (adaLN-Zero; the default, byte-for-byte baseline)
+      "mlp"  → FFN branch only; the mixer branch's shift/scale/gate become a
+               condition-INDEPENDENT zero-init bias, so SSC is the only route
+               into the SSM (the branch SSC can actually act on)
+      "none" → neither branch; SSC is the only conditioning path in the model
+    """
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=16, d_conv=3, expand=1, K=4,
                  attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none",
-                 in_context_layout="prefix"):
+                 in_context_layout="prefix", adaln_cond="full"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -465,19 +474,60 @@ class JiTBlock(nn.Module):
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
-        )
+        assert adaln_cond in ("full", "mlp", "none"), adaln_cond
+        self.adaln_cond = adaln_cond
+        # The condition-independent halves are bare zero-init biases: adaLN fed
+        # a CONSTANT collapses to its Linear's bias (SiLU(0) = 0), so this is
+        # functionally adaLN-with-c=0 without carrying a dead D x kD weight
+        # matrix. Zero-init keeps every gate at 0 → identity at init, exactly
+        # as adaLN-Zero does.
+        n_cond = {"full": 6, "mlp": 3, "none": 0}[adaln_cond]
+        if n_cond:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, n_cond * hidden_size, bias=True),
+            )
+        if n_cond < 6:
+            self.adaLN_bias = nn.Parameter(torch.zeros((6 - n_cond) * hidden_size))
 
-    def forward(self, x, c, H, W):
+    def forward(self, x, c, H, W, c_ssc=None):
+        """c: adaLN condition | c_ssc: SSC condition (defaults to c)."""
+        parts = []
+        if self.adaln_cond != "full":
+            # static msa triple first; "mlp" appends the conditional FFN triple
+            parts.append(self.adaLN_bias[None, :].expand(x.shape[0], -1))
+        if self.adaln_cond != "none":
+            parts.append(self.adaLN_modulation(c))
+        mod = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-            self.adaLN_modulation(c).chunk(6, dim=-1)
+            mod.chunk(6, dim=-1)
         x = x + gate_msa.unsqueeze(1) * self.mixer(
-            modulate(self.norm1(x), shift_msa, scale_msa), H, W, cond=c)
+            modulate(self.norm1(x), shift_msa, scale_msa), H, W,
+            cond=(c if c_ssc is None else c_ssc))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
             modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
+
+
+class FinalLayerStatic(nn.Module):
+    """FinalLayer with condition-independent (bare bias) modulation.
+
+    Used when adaln_cond="none": identical algebra to FinalLayer fed c = 0,
+    without the dead Linear(D -> 2D). Zero-init shift/scale + zero-init output
+    keep the model's init behaviour identical to the baseline. Defined here
+    rather than in src/primitives.py so jit.py / vim.py stay untouched.
+    """
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        self.norm_final = RMSNorm(hidden_size)
+        self.linear = nn.Linear(hidden_size,
+                                patch_size * patch_size * out_channels, bias=True)
+        self.adaLN_bias = nn.Parameter(torch.zeros(2 * hidden_size))
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_bias[None, :].expand(x.shape[0], -1).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        return self.linear(x)
 
 
 # ── JiT-VMamba model (from jit-vmamba-cifar10 Cell 15) ───────────────────────
@@ -533,8 +583,49 @@ class JiTVMamba(nn.Module):
         #   "abc"  → "bc" + per-direction sigmoid decay gate on the
         #            effective A (exact via the Δ·s / B÷s identity)
         ssc: str = "none",
+        # ── SSC as a REPLACEMENT for adaLN (literal DiM-2), off by default ──
+        #   Which residual branches adaLN still carries (t, y) into:
+        #     "full" (True)  → both; every existing arm, byte-for-byte.
+        #     "mlp"          → the FFN branch (and the output head) only; the
+        #                      MIXER branch's shift/scale/gate become a
+        #                      condition-independent zero-init bias, so (t, y)
+        #                      reach the SS2D scan ONLY through SSC. SSC can
+        #                      only modulate B/C(+A) inside the mixer, so this
+        #                      replaces adaLN exactly where SSC can act and
+        #                      leaves the FFN unhandicapped. ~ -5.3M params.
+        #     "none" (False) → neither; SSC is the ONLY conditioning path in
+        #                      the model (FinalLayer goes static too).
+        #   Anything but "full" requires ssc != "none" (else nothing at all is
+        #   conditional). Bools are accepted for back-compat with the configs
+        #   written by the notebooks' install_noadaln.sh.
+        adaln_cond="full",
+        #   ssc_z_mlp=True → give SSC DiM-2's dedicated z = MLP(t, c) instead of
+        #   the raw shared c, so the replacement arm is not handicapped by a
+        #   condition representation shaped for adaLN. z goes to the SSC path
+        #   ONLY; any surviving adaLN keeps consuming the raw c.
+        ssc_z_mlp: bool = False,
     ):
         super().__init__()
+        if isinstance(adaln_cond, bool):          # install_noadaln.sh configs
+            adaln_cond = "full" if adaln_cond else "none"
+        assert adaln_cond in ("full", "mlp", "none"), (
+            "Unknown adaln_cond=%r (use 'full', 'mlp' or 'none')" % (adaln_cond,)
+        )
+        assert adaln_cond == "full" or ssc != "none", (
+            "adaln_cond=%r removes adaLN conditioning from the mixer branch; "
+            "enable an ssc arm (static/bc/abc) or keep adaLN on." % (adaln_cond,)
+        )
+        assert adaln_cond == "full" or in_context_len == 0, (
+            "adaln_cond=%r is part of the SSC-replacement arm; combining it "
+            "with the in-context prefix mixes two separate experiments."
+            % (adaln_cond,)
+        )
+        assert not ssc_z_mlp or adaln_cond != "full", (
+            "ssc_z_mlp is DiM-2's condition path for the replacement arm; "
+            "only use it with adaln_cond='mlp' or 'none'."
+        )
+        self.adaln_cond = adaln_cond
+        self.ssc_z_mlp  = ssc_z_mlp
         self.in_channels  = in_channels
         self.out_channels = in_channels
         self.patch_size   = patch_size
@@ -618,11 +709,21 @@ class JiTVMamba(nn.Module):
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 state_init=state_init, ssc=ssc,
                 in_context_layout=in_context_layout,
+                adaln_cond=adaln_cond,
             )
             for i in range(depth)
         ])
 
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        # DiM-2's z = MLP(t, c); only built for the adaLN-replacement arms.
+        self.ssc_z = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        ) if ssc_z_mlp else None
+
+        self.final_layer = (
+            FinalLayerStatic if adaln_cond == "none" else FinalLayer
+        )(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -667,12 +768,19 @@ class JiTVMamba(nn.Module):
                 nn.init.constant_(block.mixer.cond_B_proj.weight, 0)
                 nn.init.constant_(block.mixer.cond_C_proj.weight, 0)
 
-        # adaLN-Zero
+        # adaLN-Zero (and, where adaln_cond replaced a half of it, the zero-init
+        # static biases that stand in for it — same identity-at-init guarantee).
         for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+            if self.adaln_cond != "none":
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            if self.adaln_cond != "full":
+                nn.init.constant_(block.adaLN_bias, 0)
+        if self.adaln_cond == "none":
+            nn.init.constant_(self.final_layer.adaLN_bias, 0)
+        else:
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
 
         # Zero output
         nn.init.constant_(self.final_layer.linear.weight, 0)
@@ -718,6 +826,9 @@ class JiTVMamba(nn.Module):
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y)
         c = t_emb + y_emb
+        # DiM-2's dedicated z = MLP(t, c) for the SSC path only; any surviving
+        # adaLN keeps consuming the raw c, so the two routes stay separable.
+        c_ssc = self.ssc_z(c) if self.ssc_z is not None else None
 
         x = self.x_embedder(x)
         x = x + self.pos_embed
@@ -730,7 +841,7 @@ class JiTVMamba(nn.Module):
             if self.in_context_len > 0 and i == self.in_context_start:
                 ctx = self._build_prefix(t_emb, y_emb)
                 x = torch.cat([ctx, x], dim=1)         # (B, in_context_len + L, D)
-            x = block(x, c, H, W)
+            x = block(x, c, H, W, c_ssc=c_ssc)
 
         # Strip the prefix once, after the final block.
         if self.in_context_len > 0:

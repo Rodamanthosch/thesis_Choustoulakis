@@ -233,6 +233,24 @@ python scripts/run_experiment.py --config configs/cifar10/jit-s-baseline.yaml \
     model.in_context_start=4
 ```
 
+### In-context conditioning on JiT-S2-VMamba (prefix vs row layout)
+`in_context_layout` decides *where* the condition tokens sit inside every SS2D scan:
+`prefix` stacks them all at the head (DiM), `row` interleaves one content unit at the
+head of every row (scan directions 0/1) / column (directions 2/3), so no image token is
+more than `W` scan steps from a condition token. Under `row`, `in_context_len` must be a
+multiple of the grid size, and `time_class` takes exactly `2 × grid_size` (a `[t,y]` unit
+per row).
+
+```bash
+# one [t,y] unit per row/column — 16 tokens, scan L = 64 + 16
+python scripts/run_experiment.py \
+    --config configs/tiny_imagenet/jit-s2-vmamba-incontext-row-timeclass.yaml
+
+# one class token per row/column — 8 tokens, scan L = 64 + 8
+python scripts/run_experiment.py \
+    --config configs/tiny_imagenet/jit-s2-vmamba-incontext-row-class.yaml
+```
+
 ### Change dataset path
 ```bash
 # Kaggle default (CIFAR-10 downloads automatically)
@@ -309,8 +327,10 @@ On Kaggle after a 100-epoch run:
 | `model` | `num_heads` | 6 | Attention heads (JiT only) |
 | `model` | `patch_size` | 2 | Patch size → (img/p)² tokens |
 | `model` | `bottleneck_dim` | 128 | Patch embed bottleneck |
-| `model` | `in_context_len` | 0 | In-context tokens (0=off, JiT only) |
+| `model` | `in_context_len` | 0 | In-context tokens (0=off) |
 | `model` | `in_context_start` | 0 | Block to start prepending |
+| `model` | `in_context_content` | `time_class` | `time_class` \| `class` (VMamba only) |
+| `model` | `in_context_layout` | `prefix` | `prefix` \| `row` — all at the scan head, or one content unit per row/column (VMamba only) |
 | `model` | `d_state` | 16 | SSM state size (Mamba only) |
 | `model` | `d_conv` | 4/3 | SSM conv size (Mamba only) |
 | `model` | `expand` | 1 | SSM expand ratio (Mamba only) |

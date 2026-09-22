@@ -87,6 +87,7 @@ def build_model(cfg):
             in_context_len=m.get("in_context_len", 0),
             in_context_start=m.get("in_context_start", 0),
             in_context_content=m.get("in_context_content", "time_class"),
+            in_context_layout=m.get("in_context_layout", "prefix"),
             state_init=m.get("state_init", "none"),
             ssc=m.get("ssc", "none"),
         )

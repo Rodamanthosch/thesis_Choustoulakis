@@ -79,6 +79,7 @@ class SS2D(nn.Module):
         proj_drop: float = 0.0,
         state_init: str = "none",     # "none" | "dimsum" | "learned"
         ssc: str = "none",            # "none" | "static" | "bc" | "abc"  (DiM-2 SSC; "static" = bias-only control)
+        in_context_layout: str = "prefix",   # "prefix" | "row"  (where the condition tokens sit in the scan)
     ):
         super().__init__()
         self.d_model = d_model
@@ -87,6 +88,14 @@ class SS2D(nn.Module):
         self.d_inner = int(expand * d_model)
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(d_model / 16)
         self.K = K
+
+        # Where the in-context condition tokens are placed in the scan (§3b).
+        #   "prefix" → all at the head of every direction (DiM; the default and the
+        #              byte-for-byte path for every previously existing arm)
+        #   "row"    → one content unit of U = extra_len // H tokens at the head of
+        #              every row (directions 0/1) / column (directions 2/3)
+        assert in_context_layout in ("prefix", "row"), in_context_layout
+        self.in_context_layout = in_context_layout
 
         # ── 1. Input projection (no gate branch) ──────────────────────
         self.in_proj = nn.Linear(d_model, self.d_inner, bias=False)
@@ -214,7 +223,23 @@ class SS2D(nn.Module):
           sum. The updated extra outputs are returned in-place (positions
           0..extra_len) so they persist & update across blocks like DiM.
 
-        extra_len == 0 recovers the byte-for-byte baseline path.
+        in_context_layout == "row" (extra_len > 0):
+          Same tokens, same merge, different placement: instead of stacking all
+          `extra_len` of them at the head, a content unit of U = extra_len // H
+          tokens is interleaved at the head of EVERY row of each direction's
+          scan (a row for directions 0/1, a column for 2/3, since cross_scan
+          flattens row-major for 0/1 and column-major for 2/3). Every image
+          token is then within W scan steps of a condition token instead of up
+          to HW, and the unit leading row j reads rows 0..j-1 through the
+          recurrent state — unlike the head prefix, which never reads the image.
+          The extras are still inserted AFTER cross_scan and still sit in
+          canonical order in every direction, so the plain-sum merge above is
+          unchanged. The model-level token layout is also unchanged
+          ([extra_len condition tokens, HW grid tokens]), so persist & update
+          and the strip-after-the-last-block are identical.
+
+        extra_len == 0 recovers the byte-for-byte baseline path, and
+        in_context_layout == "prefix" is byte-for-byte the previous prefix path.
         """
         B, L_in, D = x.shape
         K = self.K
@@ -236,14 +261,43 @@ class SS2D(nn.Module):
         # ── 3. CrossScan: 4 directions over the pure H×W grid ────────
         xs = cross_scan(z2d)                                    # (B, K, d_inner, HW)
 
-        # ── 3b. Prepend the condition seed to the head of every scan ─
+        # ── 3b. Place the condition seed into every scan ──────────────
         if extra_len > 0:
             # Same seed fed to all K directions; each direction's x_proj[k]
-            # still gives it a distinct Δ/B/C. Seed leads the scan → it seeds
-            # the recurrent state for every image token, in every direction.
+            # still gives it a distinct Δ/B/C.
             seed = z_extra.transpose(1, 2)[:, None]             # (B, 1, d_inner, extra_len)
             seed = seed.expand(B, K, d_inner, extra_len).to(xs.dtype)
-            xs = torch.cat([seed, xs], dim=-1)                  # (B, K, d_inner, extra_len+HW)
+            if self.in_context_layout == "prefix":
+                # Seed leads the scan → it seeds the recurrent state for every
+                # image token, in every direction.
+                xs = torch.cat([seed, xs], dim=-1)              # (B, K, d_inner, extra_len+HW)
+            else:  # "row"
+                # One content unit of U tokens at the head of every row. The
+                # pattern is perfectly regular (U condition tokens then W grid
+                # tokens, H times), so the interleave is a cat + reshape.
+                # cross_scan flattens row-major for directions 0/1 and
+                # column-major for 2/3, so "every W steps" is one unit per row
+                # in 0/1 and one per column in 2/3 — no per-direction indexing.
+                assert extra_len % H == 0, (
+                    "in_context_layout='row' needs in_context_len divisible by the "
+                    "grid size H=%d; got %d" % (H, extra_len)
+                )
+                # One shared reshape into (H, W) blocks is "one unit per row" for
+                # the row-major directions 0/1 and "one per column" for the
+                # column-major 2/3 ONLY when the grid is square: directions 2/3
+                # scan W groups of H. JiTVMamba always passes H == W; this guards
+                # a future non-square grid from silently getting the units at
+                # non-column boundaries in half the directions.
+                assert H == W, (
+                    "in_context_layout='row' assumes a square grid (got H=%d, W=%d): "
+                    "directions 2/3 scan column-major, so a per-row insertion stride "
+                    "only coincides with column starts when H == W." % (H, W)
+                )
+                U = extra_len // H
+                xs = torch.cat(
+                    [seed.reshape(B, K, d_inner, H, U),
+                     xs.reshape(B, K, d_inner, H, W)], dim=-1
+                ).reshape(B, K, d_inner, H * (U + W))           # (B, K, d_inner, extra_len+HW)
 
         # ── 4. Per-direction x_proj (also covers the prepended condition tokens):
         # xs (B,K,d_inner,L) × x_proj_weight (K,dt_rank+2N,d_inner) → (B,K,dt_rank+2N,L)
@@ -369,8 +423,14 @@ class SS2D(nn.Module):
         #        Extras: plain sum over directions (cross_merge analog; no
         #        un-permute needed — they were never reordered).
         if extra_len > 0:
-            ys_extra = ys[:, :, :, :extra_len]            # (B, K, d_inner, extra_len)
-            ys_grid  = ys[:, :, :, extra_len:]            # (B, K, d_inner, HW)
+            if self.in_context_layout == "prefix":
+                ys_extra = ys[:, :, :, :extra_len]        # (B, K, d_inner, extra_len)
+                ys_grid  = ys[:, :, :, extra_len:]        # (B, K, d_inner, HW)
+            else:  # "row": undo the interleave of 3b
+                U = extra_len // H
+                ys_r     = ys.view(B, K, d_inner, H, U + W)
+                ys_extra = ys_r[..., :U].reshape(B, K, d_inner, extra_len)
+                ys_grid  = ys_r[..., U:].reshape(B, K, d_inner, HW)
             out_grid  = cross_merge(ys_grid, H, W)        # (B, d_inner, HW)
             out_extra = ys_extra.sum(dim=1)               # (B, d_inner, extra_len)
             out = torch.cat([out_extra, out_grid], dim=-1)  # (B, d_inner, extra_len+HW)
@@ -391,7 +451,8 @@ class JiTBlock(nn.Module):
     """JiT block with adaLN-Zero conditioning, SS2D mixer, and SwiGLU FFN."""
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=16, d_conv=3, expand=1, K=4,
-                 attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none"):
+                 attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none",
+                 in_context_layout="prefix"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -399,6 +460,7 @@ class JiTBlock(nn.Module):
             d_model=hidden_size,
             d_state=d_state, d_conv=d_conv, expand=expand, K=K,
             proj_drop=proj_drop, state_init=state_init, ssc=ssc,
+            in_context_layout=in_context_layout,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -449,6 +511,13 @@ class JiTVMamba(nn.Module):
         in_context_len: int = 0,
         in_context_start: int = 0,
         in_context_content: str = "time_class",   # "time_class" | "class"
+        #   in_context_layout: WHERE those tokens sit inside every scan.
+        #   "prefix" → all at the head (DiM; the default, byte-for-byte as before)
+        #   "row"    → one content unit of U = in_context_len // grid_size tokens
+        #              at the head of every row (dirs 0/1) / column (dirs 2/3),
+        #              so no image token is more than W scan steps from a
+        #              condition token and each unit reads the rows before it
+        in_context_layout: str = "prefix",        # "prefix" | "row"
         # ── DiMSUM-style scan-state-init conditioning (off by default) ──
         #   "none"    → baseline / in-context arms (unchanged, byte-for-byte)
         #   "dimsum"  → paper-literal h_{-1} = W_u(c) per direction, per block
@@ -475,6 +544,7 @@ class JiTVMamba(nn.Module):
         self.in_context_len     = in_context_len
         self.in_context_start   = in_context_start
         self.in_context_content = in_context_content
+        self.in_context_layout  = in_context_layout
         self.state_init         = state_init
         self.ssc                = ssc
         n_arms = (state_init != "none") + (in_context_len > 0) + (ssc != "none")
@@ -483,13 +553,39 @@ class JiTVMamba(nn.Module):
             "conditioning arms — enable at most one per run."
         )
 
+        # Spatial grid size (used by SS2D mixers)
+        self.grid_size = input_size // patch_size
+
         # Learnable positional slots for the prefix tokens (DiM additional_embed).
+        if in_context_layout not in ("prefix", "row"):
+            raise ValueError(
+                "Unknown in_context_layout=%r (use 'prefix' or 'row')"
+                % in_context_layout
+            )
+        if in_context_layout == "row":
+            assert in_context_len > 0, (
+                "in_context_layout='row' needs in_context_len > 0 "
+                "(it is a placement for the in-context tokens, not an arm of its own)."
+            )
+            assert in_context_len % self.grid_size == 0, (
+                "in_context_layout='row' places one content unit per row/column, so "
+                "in_context_len must be a multiple of the grid size %d; got %d"
+                % (self.grid_size, in_context_len)
+            )
         if in_context_len > 0:
             if in_context_content == "time_class":
-                assert in_context_len in (2, 4), (
-                    "in_context_content='time_class' expects in_context_len 2 "
-                    "([t,y]) or 4 ([t,y,y,t]); got %d" % in_context_len
-                )
+                if in_context_layout == "row":
+                    # One DiM [t,y] unit (K=2) at the head of every row/column.
+                    assert in_context_len == 2 * self.grid_size, (
+                        "in_context_content='time_class' with layout='row' expects "
+                        "in_context_len = 2 * grid_size = %d ([t,y] per row); got %d"
+                        % (2 * self.grid_size, in_context_len)
+                    )
+                else:
+                    assert in_context_len in (2, 4), (
+                        "in_context_content='time_class' expects in_context_len 2 "
+                        "([t,y]) or 4 ([t,y,y,t]); got %d" % in_context_len
+                    )
             elif in_context_content == "class":
                 assert in_context_len >= 1
             else:
@@ -500,9 +596,6 @@ class JiTVMamba(nn.Module):
             self.incontext_pos_embed = nn.Parameter(
                 torch.zeros(1, in_context_len, hidden_size)
             )
-
-        # Spatial grid size (used by SS2D mixers)
-        self.grid_size = input_size // patch_size
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
@@ -524,6 +617,7 @@ class JiTVMamba(nn.Module):
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 state_init=state_init, ssc=ssc,
+                in_context_layout=in_context_layout,
             )
             for i in range(depth)
         ])
@@ -595,13 +689,25 @@ class JiTVMamba(nn.Module):
     def _build_prefix(self, t_emb, y_emb):
         """Build the DiM-style condition prefix (B, in_context_len, D).
 
-        content="time_class":  len 2 → [t, y];  len 4 → [t, y, y, t]  (DiM mirror)
-        content="class":       len n → [y] * n  (JiT Table 9 / DiS style, K-sweep)
-        A learnable positional slot is added per token (DiM additional_embed).
+        layout="prefix" (all tokens at the head of every scan):
+          content="time_class":  len 2 → [t, y];  len 4 → [t, y, y, t]  (DiM mirror)
+          content="class":       len n → [y] * n  (JiT Table 9 / DiS style, K-sweep)
+
+        layout="row" (one content unit per row/column; len = grid_size * U):
+          content="time_class":  U=2 → [t, y] * grid_size   (DiM K=2 unit per row)
+          content="class":       U=1 → [y]   * grid_size
+          Model order is unit-major ([u_0 of row 0, ..., u_{U-1} of row 0, u_0 of
+          row 1, ...]) because SS2D reshapes these to (H, U) to interleave them.
+
+        A learnable positional slot is added per token (DiM additional_embed), so
+        the per-row copies can still specialise.
         """
         n = self.in_context_len
         if self.in_context_content == "time_class":
-            toks = [t_emb, y_emb] if n == 2 else [t_emb, y_emb, y_emb, t_emb]
+            if self.in_context_layout == "row":
+                toks = [t_emb, y_emb] * self.grid_size          # [t,y] per row
+            else:
+                toks = [t_emb, y_emb] if n == 2 else [t_emb, y_emb, y_emb, t_emb]
         else:  # "class"
             toks = [y_emb] * n
         ctx = torch.stack(toks, dim=1)                 # (B, n, D)

@@ -1,0 +1,90 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D) on Tiny-ImageNet 64x64 — OPTION A, layout=row, content=class
+# ------------------------------------------------------------
+# The cheap half of the row-distributed pair: ONE class token at the head of
+# every row (directions 0/1) / column (directions 2/3), instead of the K
+# class tokens stacked at the head of the sequence.
+#
+#   in_context_len = grid_size = 8   ([y] per row)
+#   scan length L  = 64 + 8 = 72     (+12.5% vs baseline)
+#
+# Compare against `class` K=1 PREFIX (89.20 FID, +1.0% GMACs) and the flat
+# prefix K-sweep (K=1/16/32 -> 89.20 / 89.51 / 89.44, a span of 0.31 points).
+# That flatness is why the arm is interesting: if MORE tokens at the head buy
+# nothing, but the SAME tokens spread along the scan do, the effect is position,
+# not count. See jit-s2-vmamba-incontext-row-timeclass.yaml for the full
+# rationale and the design matrix.
+#
+# LENGTH-MATCHED CONTROL (recommended, no new file needed):
+#   python scripts/run_experiment.py \
+#     --config configs/tiny_imagenet/jit-s2-vmamba-incontext-class.yaml \
+#     model.in_context_len=8 \
+#     checkpoint.output_dir=experiments/tiny_imagenet/vmamba-incontext-K8
+# That is the same 8 tokens at the head, so row vs prefix becomes position-only.
+#
+# Everything else (recipe, CFG, eval protocol, in_context_start=4) is identical
+# to jit-s2-vmamba-incontext-class.yaml so the comparison is controlled.
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-incontext-row-class
+  model: vmamba
+  dataset: imagenet                 # ImageFolder; works on tiny-imagenet-200/train
+  data_dir: ./data/tiny-imagenet-200   # <-- set to your tiny-imagenet-200 path
+  seed: 42
+
+model:
+  input_size: 64                    # Tiny-IN native res
+  patch_size: 8                     # 64/8 = 8x8 = 64 tokens, grid_size = 8
+  in_channels: 3
+  hidden_size: 384                  # S scale
+  depth: 12
+  num_heads: 6                      # unused by vmamba, kept for parity
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  # SS2D knobs (VMamba: d_conv=3, NOT ViM's 4)
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4                              # number of CrossScan directions (NOT the token count)
+  # -- Option A: in-context tokens, distributed one [y] per row/column --
+  in_context_len: 8                 # grid_size; must be a multiple of it under layout=row
+  in_context_start: 4               # tokens injected from block 4 onward (blocks 0-3 pure grid)
+  in_context_content: class         # time_class | class
+  in_context_layout: row            # prefix | row   <-- the only change vs the prefix arm
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-incontext-row-class

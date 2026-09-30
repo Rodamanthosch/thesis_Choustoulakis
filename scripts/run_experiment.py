@@ -127,6 +127,7 @@ def build_model(cfg):
             ssc=m.get("ssc", "none"),
             adaln_cond=m.get("adaln_cond", "full"),
             ssc_z_mlp=m.get("ssc_z_mlp", False),
+            ffn=m.get("ffn", "swiglu"),
         )
     else:
         raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba")

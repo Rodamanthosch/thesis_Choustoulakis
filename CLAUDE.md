@@ -48,6 +48,26 @@ adaLN keeps consuming the raw `c`. `none` keeps the parameter names the
 notebooks' `install_noadaln.sh` used (`blocks.*.adaLN_bias`,
 `final_layer.adaLN_bias`), so checkpoints from those runs still load.
 
+## FFN variant (`ffn`)
+
+`ffn` swaps the block FFN and is **orthogonal** to every conditioning arm (it
+does not enter `n_arms`; combine it with any arm by adding one config key).
+Both conv FFNs keep SwiGLU's param-matched width `int(mlp_ratio * D * 2/3)`
+and use SiLU; `u` is the modulated `norm2(x)`, DW a depthwise 3×3 over the
+H×W token grid.
+
+| `ffn` | maths | per block (D=384) | Tiny-IN S/12 |
+|---|---|---|---|
+| `swiglu` (default) | `W2(SiLU(g)·v)`, `[g,v]=W1 u` | 1,182,080 | 31.03M |
+| `convglu` (TransNeXt, GELU→SiLU) | `W2(SiLU(DW(g))·v)` | +10,240 | 31.15M |
+| `glumbconv` (SANA Mix-FFN) | `s=DW(SiLU(W1 u))`, `[a,g]=s`, `W3(a·SiLU(g))`, no out bias | +20,096 | 31.27M |
+
+In-context prefix tokens (the first `N - H·W` of `x`, for both layouts) are
+not on the grid: they see only the conv's centre tap, so the FFN never mixes
+prefix and image tokens. `tests/test_ffn_cpu.py` proves `swiglu` is
+bit-identical to HEAD and that both conv FFNs match verbatim transcriptions of
+the TransNeXt / SANA modules; `scripts/check_ffn_cuda.py` is the GPU check.
+
 When adding a new arm, keep the "off" setting byte-identical to the previous
 model and prove it in a CPU test under `tests/` (see
 `tests/test_incontext_row_cpu.py` check A, which transplants weights from

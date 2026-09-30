@@ -178,6 +178,87 @@ class SwiGLUFFN(nn.Module):
         return self.w3(self.ffn_dropout(hidden))
 
 
+# ── Conv FFNs: ConvGLU (TransNeXt) and GLUMBConv / Mix-FFN (SANA) ────────────
+#
+# Both add a depthwise 3x3 conv over the H x W token grid inside a GLU. Width
+# follows SwiGLUFFN (hidden_dim -> int(hidden_dim * 2/3)), so they are
+# param-matched to it up to the conv's 9h + h (ConvGLU) / 18h + 2h (GLUMBConv).
+# The activation is SiLU throughout (TransNeXt uses GELU; SANA already SiLU).
+# 1x1 convs are written as nn.Linear on (B, N, C): the same maths as SANA's
+# Conv2d-1x1, no NCHW round trip, and the same xavier init as SwiGLU's linears.
+
+def _dwconv_tokens(conv, x, H, W):
+    """Depthwise conv over the token grid of x: (B, N, C) with N = P + H*W.
+
+    The trailing H*W tokens are the image grid in row-major order (as patchify
+    lays them out). The leading P = N - H*W tokens are the in-context prefix,
+    which SS2D returns in front of the grid for both layouts. Each prefix token
+    is treated as an isolated zero-padded 1x1 image, so only the kernel's
+    centre tap reaches it and nothing mixes between prefix and grid.
+    """
+    B, N, C = x.shape
+    P = N - H * W
+    assert P >= 0, f"conv FFN got N={N} < H*W={H * W}"
+    grid = x[:, P:].transpose(1, 2).reshape(B, C, H, W)
+    grid = conv(grid).flatten(2).transpose(1, 2)            # (B, HW, C)
+    if P == 0:
+        return grid
+    k = conv.kernel_size[0] // 2
+    extra = x[:, :P] * conv.weight[:, 0, k, k]
+    if conv.bias is not None:
+        extra = extra + conv.bias
+    return torch.cat([extra.to(grid.dtype), grid], dim=1)
+
+
+class ConvGLUFFN(nn.Module):
+    """ConvGLU (TransNeXt, CVPR 2024), GELU -> SiLU.
+
+    Matches DaiShiResearch/TransNeXt classification/transnext.py
+    ConvolutionalGLU + DWConv:
+        [g, v] = fc1(u);  y = fc2( SiLU(DWConv3x3(g)) * v )
+    i.e. SwiGLUFFN with a depthwise conv on the gate half before its SiLU.
+    """
+    def __init__(self, dim, hidden_dim, drop=0.0, bias=True):
+        super().__init__()
+        hidden_dim = int(hidden_dim * 2 / 3)
+        self.fc1 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
+        self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1,
+                                padding=1, bias=True, groups=hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, dim, bias=bias)
+        self.ffn_dropout = nn.Dropout(drop)
+
+    def forward(self, x, H, W):
+        g, v = self.fc1(x).chunk(2, dim=-1)
+        hidden = F.silu(_dwconv_tokens(self.dwconv, g, H, W)) * v
+        return self.fc2(self.ffn_dropout(hidden))
+
+
+class GLUMBConvFFN(nn.Module):
+    """Mix-FFN / GLUMBConv (SANA, ICLR 2025).
+
+    Matches NVlabs/Sana diffusion/model/nets/basic_modules.py GLUMBConv as
+    wired in the Sana blocks (use_bias=(True, True, False), norm=None,
+    act=("silu", "silu", None)):
+        s = SiLU(inverted_conv(u));  s = DWConv3x3(s)   (all 2h channels)
+        [a, g] = s;                  y = point_conv( a * SiLU(g) )   (no bias)
+    Width is param-matched to SwiGLUFFN rather than SANA's int(D * mlp_ratio).
+    """
+    def __init__(self, dim, hidden_dim, drop=0.0):
+        super().__init__()
+        hidden_dim = int(hidden_dim * 2 / 3)
+        self.inverted_conv = nn.Linear(dim, 2 * hidden_dim, bias=True)
+        self.depth_conv = nn.Conv2d(2 * hidden_dim, 2 * hidden_dim, kernel_size=3,
+                                    stride=1, padding=1, bias=True,
+                                    groups=2 * hidden_dim)
+        self.point_conv = nn.Linear(hidden_dim, dim, bias=False)
+        self.ffn_dropout = nn.Dropout(drop)
+
+    def forward(self, x, H, W):
+        x = F.silu(self.inverted_conv(x))
+        a, g = _dwconv_tokens(self.depth_conv, x, H, W).chunk(2, dim=-1)
+        return self.point_conv(self.ffn_dropout(a * F.silu(g)))
+
+
 # ── modulate + FinalLayer (identical across all three notebooks) ──────────────
 
 def modulate(x, shift, scale):

@@ -24,8 +24,16 @@ from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from src.primitives import (
     RMSNorm, get_2d_sincos_pos_embed,
     TimestepEmbedder, LabelEmbedder,
-    BottleneckPatchEmbed, SwiGLUFFN, FinalLayer, modulate,
+    BottleneckPatchEmbed, SwiGLUFFN, ConvGLUFFN, GLUMBConvFFN,
+    FinalLayer, modulate,
 )
+
+# FFN variants selectable by `ffn` (orthogonal to the conditioning arms).
+FFN_CLASSES = {
+    "swiglu": SwiGLUFFN,        # token-wise (the default, byte-for-byte baseline)
+    "convglu": ConvGLUFFN,      # TransNeXt: DWConv3x3 on the gate half
+    "glumbconv": GLUMBConvFFN,  # SANA Mix-FFN: SiLU -> DWConv3x3 on both halves
+}
 
 
 # ── CrossScan / CrossMerge (from jit-vmamba-cifar10 Cell 7) ─────────────────
@@ -461,7 +469,7 @@ class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=16, d_conv=3, expand=1, K=4,
                  attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none",
-                 in_context_layout="prefix", adaln_cond="full"):
+                 in_context_layout="prefix", adaln_cond="full", ffn="swiglu"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -473,7 +481,8 @@ class JiTBlock(nn.Module):
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
+        self.mlp = FFN_CLASSES[ffn](hidden_size, mlp_hidden_dim, drop=proj_drop)
+        self.ffn_spatial = ffn != "swiglu"   # conv FFNs need the (H, W) grid
         assert adaln_cond in ("full", "mlp", "none"), adaln_cond
         self.adaln_cond = adaln_cond
         # The condition-independent halves are bare zero-init biases: adaLN fed
@@ -504,8 +513,9 @@ class JiTBlock(nn.Module):
         x = x + gate_msa.unsqueeze(1) * self.mixer(
             modulate(self.norm1(x), shift_msa, scale_msa), H, W,
             cond=(c if c_ssc is None else c_ssc))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(self.norm2(x), shift_mlp, scale_mlp))
+        h = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        h = self.mlp(h, H, W) if self.ffn_spatial else self.mlp(h)
+        x = x + gate_mlp.unsqueeze(1) * h
         return x
 
 
@@ -604,8 +614,21 @@ class JiTVMamba(nn.Module):
         #   condition representation shaped for adaLN. z goes to the SSC path
         #   ONLY; any surviving adaLN keeps consuming the raw c.
         ssc_z_mlp: bool = False,
+        # ── FFN variant (orthogonal to every conditioning arm; not in n_arms) ──
+        #   "swiglu"    → token-wise SwiGLU (the default, byte-for-byte baseline)
+        #   "convglu"   → TransNeXt ConvGLU: y = W2(SiLU(DW(g)) * v), DWConv3x3
+        #                 on the gate half only (+10,240 params/block at D=384)
+        #   "glumbconv" → SANA Mix-FFN: s = DW(SiLU(W1 u)) on both halves,
+        #                 y = W3(a * SiLU(g)), no output bias (+20,096/block)
+        #   Both keep SwiGLU's param-matched width int(mlp_ratio*D*2/3); the
+        #   in-context prefix sees only the conv's centre tap (see primitives).
+        ffn: str = "swiglu",
     ):
         super().__init__()
+        assert ffn in FFN_CLASSES, (
+            "Unknown ffn=%r (use %s)" % (ffn, " | ".join(FFN_CLASSES))
+        )
+        self.ffn = ffn
         if isinstance(adaln_cond, bool):          # install_noadaln.sh configs
             adaln_cond = "full" if adaln_cond else "none"
         assert adaln_cond in ("full", "mlp", "none"), (
@@ -709,7 +732,7 @@ class JiTVMamba(nn.Module):
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 state_init=state_init, ssc=ssc,
                 in_context_layout=in_context_layout,
-                adaln_cond=adaln_cond,
+                adaln_cond=adaln_cond, ffn=ffn,
             )
             for i in range(depth)
         ])
@@ -758,6 +781,18 @@ class JiTVMamba(nn.Module):
         if self.state_init != "none":
             for block in self.blocks:
                 nn.init.constant_(block.mixer.cond_u_proj.weight, 0)
+
+        # ConvGLU: TransNeXt's _init_weights for its depthwise conv,
+        # N(0, sqrt(2 / fan_out)) with fan_out = k*k*out/groups = 9, zero bias.
+        # GLUMBConv keeps PyTorch's default conv init, as SANA does (its
+        # _basic_init, like ours, only touches nn.Linear).
+        if self.ffn == "convglu":
+            for block in self.blocks:
+                conv = block.mlp.dwconv
+                fan_out = conv.kernel_size[0] * conv.kernel_size[1] \
+                    * conv.out_channels // conv.groups
+                nn.init.normal_(conv.weight, 0, math.sqrt(2.0 / fan_out))
+                nn.init.zeros_(conv.bias)
 
         # SSC: re-zero the condition projections (adaLN-Zero discipline); the
         # static biases stay at their ones-init (Mamba-3 Table 10: positive

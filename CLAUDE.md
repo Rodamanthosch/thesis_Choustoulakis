@@ -68,6 +68,35 @@ prefix and image tokens. `tests/test_ffn_cpu.py` proves `swiglu` is
 bit-identical to HEAD and that both conv FFNs match verbatim transcriptions of
 the TransNeXt / SANA modules; `scripts/check_ffn_cuda.py` is the GPU check.
 
+## JiT-S2-Spatial-Mamba (`model: spatial_mamba`)
+
+`src/models/spatial_mamba.py` is a **separate model** (`vmamba.py` untouched):
+the JiT scaffold with Spatial-Mamba's Structure-aware SSM (Xiao et al., ICLR
+2025) as the mixer — ONE row-major scan, the hidden states fused over the H×W
+grid by dilated depthwise 3×3 convs (SASF), then `y = C·h + D·u`. The states
+come out of the **stock** kernel: with `d_state = 1` (asserted), calling
+`selective_scan_fn` with `C = 1, D = None` returns `x_t` exactly, so no forked
+CUDA op is needed. Baseline conditioning only (adaLN-Zero); the in-context /
+state-init / SSC arms are not ported.
+
+| key | values | meaning |
+|---|---|---|
+| `gate` | `true` (default) \| `false` | `LN(y)·SiLU(z)` as in the paper \| no z branch (VMamba `v05_noz`) |
+| `sasf_dilations` | list, default `[1, 3, 5]` | paper's at 16×16; Tiny-ImageNet (8×8) configs use `[1, 2, 3]` |
+| `lpu` | `none` (default) \| `zero` \| `paper` | residual DWConv3×3 before mixer and FFN; `zero` keeps blocks identity at init |
+| `expand`, `ffn` | as `vmamba` | |
+
+| Tiny-IN config | params |
+|---|---|
+| `jit-s2-vmamba-dstate1` (SS2D, `d_state: 1`, config only) | 30.20M |
+| `jit-s2-spatial-gate` (expand 1, gate, lpu zero) | 31.46M |
+| `jit-s2-spatial-nogate` (expand 1, no gate, lpu zero) | 29.69M |
+
+`tests/test_spatial_mamba_cpu.py` proves the mixer against a naive transcription
+of the paper's Eq. (2)–(3), `StateFusion` against the official module, and (check
+J) that the copied block/model scaffold is bit-identical to `JiTVMamba`'s;
+`scripts/check_spatial_cuda.py` is the GPU check.
+
 When adding a new arm, keep the "off" setting byte-identical to the previous
 model and prove it in a CPU test under `tests/` (see
 `tests/test_incontext_row_cpu.py` check A, which transplants weights from
@@ -77,8 +106,8 @@ model and prove it in a CPU test under `tests/` (see
 
 `build_model` is duplicated in `scripts/run_experiment.py` and
 `scripts/evaluate.py`. These have drifted apart before — **update both** whenever
-a model flag is added, or evaluation will silently build a different model than
-training did. `scripts/profile_model.py` has no vmamba conditioning pass-through
+a model flag is added (for `vmamba` and `spatial_mamba` alike), or evaluation
+will silently build a different model than training did. `scripts/profile_model.py` has no vmamba conditioning pass-through
 at all; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.
 

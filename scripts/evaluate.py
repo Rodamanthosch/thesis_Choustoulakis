@@ -94,8 +94,22 @@ def build_model(cfg):
             ssc_z_mlp=m.get("ssc_z_mlp", False),
             ffn=m.get("ffn", "swiglu"),
         )
+    elif arch == "spatial_mamba":
+        from src.models.spatial_mamba import JiTSpatialMamba
+        return JiTSpatialMamba(
+            input_size=m["input_size"], patch_size=m["patch_size"],
+            in_channels=m["in_channels"], hidden_size=m["hidden_size"],
+            depth=m["depth"], num_heads=m["num_heads"], mlp_ratio=m["mlp_ratio"],
+            attn_drop=m["attn_drop"], proj_drop=m["proj_drop"],
+            num_classes=m["num_classes"], bottleneck_dim=m["bottleneck_dim"],
+            d_state=m.get("d_state", 1), d_conv=m.get("d_conv", 3),
+            expand=m.get("expand", 1), gate=m.get("gate", True),
+            sasf_dilations=tuple(m.get("sasf_dilations", (1, 3, 5))),
+            lpu=m.get("lpu", "none"),
+            ffn=m.get("ffn", "swiglu"),
+        )
     else:
-        raise ValueError(f"Unknown model: {arch}")
+        raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba | spatial_mamba")
 
 
 def main():

@@ -55,6 +55,7 @@ cfg:
 sampling:
   method: heun
   steps: 50
+  amp: true                        # bf16 autocast sampling, as JiT engine_jit.py evaluate()
 
 checkpoint:
   save_last_freq: 5

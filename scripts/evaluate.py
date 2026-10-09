@@ -31,6 +31,10 @@ PATCHES:
   BUG #20 — FLOPs/MACs/params now computed via src/flops_counter.py
             (was: thop, which silently misses nn.Embedding params AND the
             SDPA attention matmuls). Replaces the thop call in section 1.
+  JiT-SAMPLING-AMP — sampling.amp: true (config) samples under bf16 autocast,
+            as LTH14/JiT engine_jit.py evaluate() does (line 109). Default off
+            (fp32 sampling, every earlier result); the ImageNet-256 configs
+            turn it on. --sampling_amp 0|1 overrides the config.
 """
 
 import argparse, os, sys, json
@@ -147,6 +151,9 @@ def main():
     parser.add_argument("--seed",         type=int, default=42,
                         help="Seed for reproducible generation (BUG #9 fix).")
     # ────────────────────────────────────────────────────────────────────────
+    parser.add_argument("--sampling_amp", type=int, default=None, choices=[0, 1],
+                        help="Override sampling.amp from config: 1 = bf16 autocast "
+                             "sampling (JiT engine_jit.py), 0 = fp32.")
     args = parser.parse_args()
 
     # ─── BUG #9 FIX: deterministic generation ──────────────────────────────
@@ -166,6 +173,8 @@ def main():
     if args.cfg_interval is not None: c_cfg["cfg_interval"] = list(args.cfg_interval)
     if args.ode_steps    is not None: s_cfg["steps"]        = args.ode_steps
     # ────────────────────────────────────────────────────────────────────────
+    sampling_amp = bool(s_cfg.get("amp", False)) if args.sampling_amp is None \
+        else bool(args.sampling_amp)
 
     out_dir = args.out_dir or os.path.join(os.path.dirname(args.checkpoint), "eval")
     os.makedirs(out_dir, exist_ok=True)
@@ -178,6 +187,7 @@ def main():
     print(f"  CFG scale   : {c_cfg['cfg_scale']}")
     print(f"  CFG interval: {c_cfg['cfg_interval']}")
     print(f"  ODE steps   : {s_cfg['steps']}")
+    print(f"  Sampling    : {'bf16 autocast (JiT)' if sampling_amp else 'fp32'}")
     print(f"  Seed        : {args.seed}")
     print(f"  Device      : {device}")
     print(f"{'='*60}\n")
@@ -267,8 +277,11 @@ def main():
             # ─── BUG #8 FIX: slice deterministic labels instead of random ───
             y  = all_labels[count:count + bs]
             # ────────────────────────────────────────────────────────────────
-            imgs = denoiser.generate(y)
-            imgs = ((imgs.clamp(-1, 1) + 1) / 2).cpu()
+            # JiT samples under bf16 autocast (engine_jit.py evaluate()).
+            with torch.autocast("cuda", dtype=torch.bfloat16,
+                                enabled=sampling_amp and device == "cuda"):
+                imgs = denoiser.generate(y)
+            imgs = ((imgs.float().clamp(-1, 1) + 1) / 2).cpu()
             for j in range(bs):
                 save_image(imgs[j], f"{gen_dir}/{count+j:05d}.png")
             count += bs

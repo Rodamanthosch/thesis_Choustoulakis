@@ -110,6 +110,7 @@ def build_model(cfg):
             expand=m.get("expand", 1), gate=m.get("gate", True),
             sasf_dilations=tuple(m.get("sasf_dilations", (1, 3, 5))),
             lpu=m.get("lpu", "none"),
+            sasf_state_kernels=m.get("sasf_state_kernels", "shared"),
             ffn=m.get("ffn", "swiglu"),
         )
     elif arch == "vmamba2":
@@ -127,8 +128,21 @@ def build_model(cfg):
             force_fp32=m.get("force_fp32", False),
             ffn=m.get("ffn", "swiglu"),
         )
+    elif arch == "vmamba_sasf":
+        from src.models.vmamba_sasf import JiTVMambaSASF
+        return JiTVMambaSASF(
+            input_size=m["input_size"], patch_size=m["patch_size"],
+            in_channels=m["in_channels"], hidden_size=m["hidden_size"],
+            depth=m["depth"], num_heads=m["num_heads"], mlp_ratio=m["mlp_ratio"],
+            attn_drop=m["attn_drop"], proj_drop=m["proj_drop"],
+            num_classes=m["num_classes"], bottleneck_dim=m["bottleneck_dim"],
+            d_state=m.get("d_state", 1), d_conv=m.get("d_conv", 3),
+            expand=m.get("expand", 1), K=m.get("K", 4),
+            sasf_dilations=tuple(m.get("sasf_dilations", (1, 3, 5))),
+            ffn=m.get("ffn", "swiglu"),
+        )
     else:
-        raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba | spatial_mamba | vmamba2")
+        raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba | spatial_mamba | vmamba2 | vmamba_sasf")
 
 
 def main():

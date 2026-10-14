@@ -27,7 +27,9 @@ Checks:
      SASF kernels, alpha and the LPU; every block is the identity at init for
      lpu none/zero; dt bias keeps its official range after initialize_weights;
      CPU bf16 autocast runs.
-  H. guards: d_state != 1, unknown lpu / ffn, and a token count != H*W fail.
+  H. guards: unknown sasf_state_kernels / lpu / ffn, and a token count != H*W
+     fail. (d_state > 1 is supported since the d_state-16 extension; it is
+     tested in tests/test_spatial_dstate16_cpu.py.)
   I. wiring: the three new Tiny-ImageNet configs build IDENTICAL models through
      scripts/run_experiment.py::build_model and scripts/evaluate.py::build_model,
      with the expected param counts (needs pyyaml; skipped otherwise).
@@ -388,12 +390,13 @@ def must_fail(fn, what):
     raise SystemExit(f"guard missing: {what}")
 
 
-must_fail(lambda: JiTSpatialMamba(d_state=16, **KW), "d_state != 1")
+must_fail(lambda: JiTSpatialMamba(sasf_state_kernels="per_map", **KW),
+          "unknown sasf_state_kernels")
 must_fail(lambda: JiTSpatialMamba(lpu="cpe", **KW), "unknown lpu")
 must_fail(lambda: JiTSpatialMamba(ffn="mixffn", **KW), "unknown ffn")
 must_fail(lambda: StructureAwareSSM(32)(torch.randn(1, HW + 2, 32), H, W),
           "token count != H*W")
-print("H  d_state != 1, unknown lpu / ffn, and a prefix (L != H*W) are rejected")
+print("H  unknown sasf_state_kernels / lpu / ffn, and a prefix (L != H*W) are rejected")
 
 
 # ═══ J. drift guard: scaffold == JiTVMamba's ═════════════════════════════════

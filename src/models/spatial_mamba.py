@@ -20,6 +20,12 @@ so calling it with C = 1 and D = None returns x_t EXACTLY. SASF and the
 observation y = h * C + u * D then run in PyTorch, as in the official ssm().
 Verified against a reference scan in tests/test_spatial_mamba_cpu.py.
 
+d_state > 1 (an extension; the paper defines N = 1 only): the scan runs over
+N * d_inner single-state channels, which is the Mamba-1 N-state recurrence
+exactly, and SASF fuses every state map with kernels shared by a channel's N
+maps or one set per state (sasf_state_kernels). Verified against a naive
+N-state transcription in tests/test_spatial_dstate16_cpu.py.
+
 Scope (v1): adaLN-Zero baseline only. None of JiT-VMamba's conditioning arms
 (in-context prefix, state-init, SSC, adaln_cond) are ported; src/models/vmamba.py
 is untouched. The block/model scaffold mirrors JiTVMamba line for line (proven
@@ -41,6 +47,7 @@ from src.primitives import (
 from src.models.vmamba import FFN_CLASSES
 
 LPU_MODES = ("none", "zero", "paper")
+STATE_KERNEL_MODES = ("shared", "per_state")   # SASF kernels at d_state > 1
 
 
 # ── Structure-aware state fusion (SASF) ──────────────────────────────────────
@@ -97,6 +104,21 @@ class StructureAwareSSM(nn.Module):
     Parameters and init follow the official StructureAwareSSM (dt_init="random",
     S4-real A, D = 1, x_proj / dt_proj stored as raw Parameters so the model's
     Linear init pass leaves them alone).
+
+    d_state > 1 (not in the paper, which only defines N = 1). Each channel c
+    then has N states x_t[c, n] with the Mamba-1 recurrence (per-channel dt,
+    per-(channel, state) A, B_t[n] shared by all channels). C = 1 can only read
+    out ONE state per channel, so the scan runs over N * d_inner single-state
+    channels -- copy n of channel c sees the same u and dt, its own A[c, n] and,
+    as B-group n, the same B_t[n] -- which IS the N-state recurrence, exactly.
+    SASF then fuses all N * d_inner state maps, and the observation contracts
+    them with C:  y_t[c] = sum_n C_t[n] h_t[c, n] + D[c] u_t[c].
+    state_kernels picks how SASF treats the N maps of one channel:
+      "shared"    -> one set of kernels per channel, applied to all N maps
+                     (SASF params as at N = 1)
+      "per_state" -> one set of kernels per (channel, state) map
+    Both fuse every map, so they cost the same compute. At N = 1 the two are
+    the same module, and the forward is the original d_state = 1 code path.
     """
     def __init__(
         self,
@@ -106,6 +128,7 @@ class StructureAwareSSM(nn.Module):
         expand: int = 1,
         gate: bool = True,
         dilations=(1, 3, 5),
+        state_kernels: str = "shared",
         dt_rank: int = None,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
@@ -113,11 +136,10 @@ class StructureAwareSSM(nn.Module):
         proj_drop: float = 0.0,
     ):
         super().__init__()
-        # C = 1 returns the states only when there is a single state per channel
-        # (y_t = sum_n C_t[n] x_t[n]); it is also the paper's setting.
-        assert d_state == 1, (
-            "StructureAwareSSM reads the scan states through C = 1, which is "
-            "exact only for d_state = 1 (the paper's setting); got %d" % d_state
+        assert d_state >= 1, d_state
+        assert state_kernels in STATE_KERNEL_MODES, (
+            "Unknown state_kernels=%r (use %s)"
+            % (state_kernels, " | ".join(STATE_KERNEL_MODES))
         )
         self.d_model = d_model
         self.d_state = d_state
@@ -125,6 +147,7 @@ class StructureAwareSSM(nn.Module):
         self.d_inner = int(expand * d_model)
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(d_model / 16)
         self.gate = bool(gate)
+        self.state_kernels = state_kernels
 
         # ── 1. Input projection (u, and z when gated) ─────────────────
         self.in_proj = nn.Linear(
@@ -169,7 +192,10 @@ class StructureAwareSSM(nn.Module):
         self.Ds._no_weight_decay = True
 
         # ── 4. Structure-aware state fusion ──────────────────────────
-        self.state_fusion = StateFusion(self.d_inner, dilations)
+        # "per_state" at d_state > 1: one kernel set per (channel, state) map,
+        # channel index n * d_inner + c (the scan's state-major layout).
+        n_maps = d_state if (state_kernels == "per_state" and d_state > 1) else 1
+        self.state_fusion = StateFusion(self.d_inner * n_maps, dilations)
 
         # ── 5. Output norm (+ gate) + projection ─────────────────────
         self.out_norm = nn.LayerNorm(self.d_inner)
@@ -201,23 +227,51 @@ class StructureAwareSSM(nn.Module):
             x_dbl, [self.dt_rank, d_state, d_state], dim=1)     # C_ssm: (B, 1, L)
         dt = torch.einsum("brl,dr->bdl", dt_r, self.dt_projs_weight)
 
-        # ── 4. ONE row-major scan, read out as states (C = 1, D = None) ─
-        A = -torch.exp(self.A_logs.float())                     # (d_inner, 1)
-        B_scan = B_ssm.unsqueeze(1).contiguous()                # (B, 1, 1, L)
-        C_one = torch.ones_like(B_scan)
-        states = selective_scan_fn(
-            u, dt.contiguous(), A, B_scan, C_one, None,
-            z=None,
-            delta_bias=self.dt_projs_bias.float(),
-            delta_softplus=True,
-            return_last_state=False,
-        )                                                       # (B, d_inner, L) = x_t
+        if d_state == 1:
+            # ── 4. ONE row-major scan, read out as states (C = 1, D = None) ─
+            A = -torch.exp(self.A_logs.float())                 # (d_inner, 1)
+            B_scan = B_ssm.unsqueeze(1).contiguous()            # (B, 1, 1, L)
+            C_one = torch.ones_like(B_scan)
+            states = selective_scan_fn(
+                u, dt.contiguous(), A, B_scan, C_one, None,
+                z=None,
+                delta_bias=self.dt_projs_bias.float(),
+                delta_softplus=True,
+                return_last_state=False,
+            )                                                   # (B, d_inner, L) = x_t
 
-        # ── 5. SASF over the 2-D grid of states ──────────────────────
-        h = self.state_fusion(states.view(B, d_inner, H, W)).reshape(B, d_inner, L)
+            # ── 5. SASF over the 2-D grid of states ──────────────────
+            h = self.state_fusion(states.view(B, d_inner, H, W)).reshape(B, d_inner, L)
 
-        # ── 6. observation y = C h + D u (official ssm()) ────────────
-        y = h * C_ssm + u * self.Ds.view(-1, 1)                 # (B, d_inner, L)
+            # ── 6. observation y = C h + D u (official ssm()) ────────
+            y = h * C_ssm + u * self.Ds.view(-1, 1)             # (B, d_inner, L)
+        else:
+            # ── 4'. N-state scan as N * d_inner single-state channels ─
+            # Channel n * d_inner + c is state n of channel c: the same u and
+            # dt (repeated), A[c, n], and B-group n (the scan's channel groups
+            # are contiguous blocks of d_inner) carrying B_t[n].
+            N = d_state
+            A = -torch.exp(self.A_logs.float()).t().reshape(N * d_inner, 1)
+            B_scan = B_ssm.unsqueeze(2).contiguous()            # (B, N, 1, L)
+            C_one = torch.ones_like(B_scan)
+            states = selective_scan_fn(
+                u.repeat(1, N, 1), dt.repeat(1, N, 1).contiguous(), A,
+                B_scan, C_one, None,
+                z=None,
+                delta_bias=self.dt_projs_bias.float().repeat(N),
+                delta_softplus=True,
+                return_last_state=False,
+            )                                                   # (B, N*d_inner, L)
+
+            # ── 5'. SASF on every state map ──────────────────────────
+            if self.state_kernels == "per_state":
+                h = self.state_fusion(states.view(B, N * d_inner, H, W))
+            else:   # "shared": the channel's kernels on each of its N maps
+                h = self.state_fusion(states.reshape(B * N, d_inner, H, W))
+            h = h.reshape(B, N, d_inner, L)
+
+            # ── 6'. observation y[c] = sum_n C[n] h[c, n] + D[c] u[c] ─
+            y = (h * C_ssm.unsqueeze(2)).sum(dim=1) + u * self.Ds.view(-1, 1)
 
         # ── 7. LayerNorm [* SiLU(z)] + out_proj ─────────────────────
         y = self.out_norm(y.transpose(1, 2))                    # (B, L, d_inner)
@@ -241,14 +295,15 @@ class JiTSpatialBlock(nn.Module):
     """
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=1, d_conv=3, expand=1, gate=True,
-                 sasf_dilations=(1, 3, 5), lpu="none",
+                 sasf_dilations=(1, 3, 5), lpu="none", sasf_state_kernels="shared",
                  attn_drop=0.0, proj_drop=0.0, ffn="swiglu"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.mixer = StructureAwareSSM(
             d_model=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand,
-            gate=gate, dilations=sasf_dilations, proj_drop=proj_drop,
+            gate=gate, dilations=sasf_dilations, state_kernels=sasf_state_kernels,
+            proj_drop=proj_drop,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -295,7 +350,8 @@ class JiTSpatialMamba(nn.Module):
 
     Class conditioning via adaLN-Zero only (no in-context tokens, no SSM-level
     conditioning). Mirrors JiTVMamba's baseline scaffold exactly; the knobs are
-    the mixer's (expand, gate, sasf_dilations), the LPU, and the FFN variant.
+    the mixer's (d_state, expand, gate, sasf_dilations, sasf_state_kernels), the
+    LPU, and the FFN variant.
     """
     def __init__(
         self,
@@ -321,6 +377,9 @@ class JiTSpatialMamba(nn.Module):
         sasf_dilations=(1, 3, 5),
         #   Local Perception Units before the mixer and the FFN: none|zero|paper
         lpu: str = "none",
+        #   d_state > 1 only: SASF kernels "shared" by a channel's N state maps,
+        #   or one set "per_state" (see StructureAwareSSM)
+        sasf_state_kernels: str = "shared",
         # FFN variant (same choices as JiTVMamba)
         ffn: str = "swiglu",
     ):
@@ -331,9 +390,15 @@ class JiTSpatialMamba(nn.Module):
         assert lpu in LPU_MODES, (
             "Unknown lpu=%r (use %s)" % (lpu, " | ".join(LPU_MODES))
         )
+        assert sasf_state_kernels in STATE_KERNEL_MODES, (
+            "Unknown sasf_state_kernels=%r (use %s)"
+            % (sasf_state_kernels, " | ".join(STATE_KERNEL_MODES))
+        )
         self.ffn = ffn
         self.lpu = lpu
         self.gate = bool(gate)
+        self.d_state = d_state
+        self.sasf_state_kernels = sasf_state_kernels
         self.sasf_dilations = tuple(sasf_dilations)
         self.in_channels  = in_channels
         self.out_channels = in_channels
@@ -363,6 +428,7 @@ class JiTSpatialMamba(nn.Module):
                 hidden_size, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 d_state=d_state, d_conv=d_conv, expand=expand, gate=gate,
                 sasf_dilations=sasf_dilations, lpu=lpu,
+                sasf_state_kernels=sasf_state_kernels,
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 ffn=ffn,

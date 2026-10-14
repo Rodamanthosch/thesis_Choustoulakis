@@ -1,0 +1,76 @@
+# ============================================================
+# JiT-S2-Spatial-Mamba on Tiny-ImageNet 64x64 -- NO GATE, d_state 16, PER_STATE
+# ------------------------------------------------------------
+# The no-gate Spatial run (jit-s2-spatial-nogate.yaml, FID-10K 93.95) with
+# d_state 1 -> 16: each channel keeps 16 SSM states (Mamba-1 recurrence),
+# SASF fuses all 384 x 16 state maps, and y = sum_n C[n] h[c, n] + D u.
+# one set of SASF kernels PER (channel, state) map (+155,520 params per block).
+# Same block otherwise: expand 1, no gate, LPU (zero-init), dilations [1,2,3].
+# adaLN-Zero baseline conditioning only.
+#
+#   mixer per block (D=384): 503,043  + LPU 7,680
+#   model: 31.76M (31,759,716) params, ~1.36 GMACs
+# Sister run: jit-s2-spatial-nogate-dstate16-shared.yaml
+# ============================================================
+
+experiment:
+  name: jit-s2-spatial-tinyin-nogate-dstate16-perstate
+  model: spatial_mamba
+  dataset: imagenet
+  data_dir: ./data/tiny-imagenet-200
+  seed: 42
+
+model:
+  input_size: 64
+  patch_size: 8
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0                    # FFN width: h = int(mlp_ratio * D * 2/3) = 1024
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16                       # 16 states per channel (Spatial-Mamba uses 1); JiM baseline's size
+  d_conv: 3
+  expand: 1                         # param-matched to VMamba-T (paper uses 2)
+  gate: false                       # true: LN(y)*SiLU(z) (paper Fig. 4) | false: no z branch
+  sasf_dilations: [1, 2, 3]         # SASF on the 8x8 grid; paper [1, 3, 5] for 16x16 (256px)
+  lpu: zero                         # Local Perception Units before mixer & FFN: none | zero | paper
+  sasf_state_kernels: per_state     # shared | per_state: SASF kernels for the 16 state maps
+  # -- FFN variant (orthogonal to the arms) --
+  ffn: swiglu                  # swiglu | convglu | glumbconv
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-spatial-nogate-dstate16-perstate

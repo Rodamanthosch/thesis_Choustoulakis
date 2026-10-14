@@ -29,6 +29,9 @@ Checks:
      every state's A, the SASF kernels and alpha, and the LPU; every block is
      the identity at init (lpu zero); CPU bf16 autocast runs.
   G. guards: unknown state_kernels fails.
+  I. grad_checkpoint (recompute each mixer in backward; on in the d_state-16
+     configs, which do not fit a 15 GB T4 at batch 128 otherwise) changes
+     nothing: same parameters, BIT-IDENTICAL output and gradients.
   H. wiring: the two d_state-16 configs build IDENTICAL models through
      scripts/run_experiment.py::build_model and scripts/evaluate.py::build_model
      (needs pyyaml; skipped otherwise).
@@ -309,6 +312,24 @@ for bad in (lambda: StructureAwareSSM(32, d_state=16, state_kernels="per_map"),
 print("G  unknown state_kernels rejected")
 
 
+# ═══ I. grad_checkpoint: same output and gradients ═══════════════════════════
+for sk in ("shared", "per_state"):
+    outs, grads = [], []
+    for ckpt in (False, True):
+        torch.manual_seed(6)
+        m = JiTSpatialMamba(d_state=16, gate=False, lpu="zero", sasf_state_kernels=sk,
+                            sasf_dilations=(1, 2, 3), grad_checkpoint=ckpt, **KW)
+        perturb(m, 0.02).train()
+        out = m(x_img, t_in, y_in)
+        out.square().mean().backward()
+        outs.append(out.detach())
+        grads.append({k: p.grad.clone() for k, p in m.named_parameters() if p.grad is not None})
+    assert torch.equal(outs[0], outs[1]), sk
+    assert grads[0].keys() == grads[1].keys(), sk
+    assert all(torch.equal(grads[0][k], grads[1][k]) for k in grads[0]), sk
+print("I  grad_checkpoint: bit-identical output and gradients (shared / per-state)")
+
+
 # ═══ H. both build_model copies agree on the new configs ═════════════════════
 try:
     import yaml                                             # noqa: E402
@@ -342,6 +363,7 @@ for name, sk, n_expect in (("jit-s2-spatial-nogate-dstate16-shared.yaml", "share
     assert set(st) == set(se) and all(torch.equal(st[k], se[k]) for k in st), name
     assert (mt.d_state, mt.sasf_state_kernels, mt.gate, mt.lpu) == (16, sk, False, "zero"), name
     assert mt.sasf_dilations == (1, 2, 3) and n_params(mt) == n_expect, (name, n_params(mt))
+    assert mt.grad_checkpoint and all(b.grad_checkpoint for b in mt.blocks), name
     print(f"H  {name}: train == eval build_model, {n_params(mt) / 1e6:.2f}M params")
 
 print("ALL CHECKS PASSED")

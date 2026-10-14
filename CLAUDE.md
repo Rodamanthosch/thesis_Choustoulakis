@@ -91,6 +91,7 @@ ported.
 | `lpu` | `none` (default) \| `zero` \| `paper` | residual DWConv3×3 before mixer and FFN; `zero` keeps blocks identity at init |
 | `d_state` | default 1 | >1: N states per channel (see above) |
 | `sasf_state_kernels` | `shared` (default) \| `per_state` | d_state > 1 only: one kernel set per channel for all its N maps \| one per (channel, state) map (+27·d_inner·(N−1) params per block); same compute |
+| `grad_checkpoint` | `false` (default) \| `true` | recompute each mixer in the backward pass (same maths, bit-identical); on in the d_state-16 configs: ≈24 → 2.5 GiB activations at batch 128 |
 | `expand`, `ffn` | as `vmamba` | |
 
 | Tiny-IN config | params |

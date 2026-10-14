@@ -37,6 +37,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
 from src.primitives import (
@@ -296,6 +297,7 @@ class JiTSpatialBlock(nn.Module):
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=1, d_conv=3, expand=1, gate=True,
                  sasf_dilations=(1, 3, 5), lpu="none", sasf_state_kernels="shared",
+                 grad_checkpoint=False,
                  attn_drop=0.0, proj_drop=0.0, ffn="swiglu"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
@@ -315,6 +317,10 @@ class JiTSpatialBlock(nn.Module):
         )
         assert lpu in LPU_MODES, lpu
         self.lpu = lpu
+        # Recompute the mixer in the backward pass instead of storing its
+        # activations (same maths; trades compute for memory -- needed at
+        # d_state 16, where each mixer holds 16x the state tensors).
+        self.grad_checkpoint = bool(grad_checkpoint)
         if lpu != "none":
             self.cpe1 = nn.Conv2d(hidden_size, hidden_size, 3, padding=1,
                                   groups=hidden_size)
@@ -333,8 +339,12 @@ class JiTSpatialBlock(nn.Module):
             self.adaLN_modulation(c).chunk(6, dim=-1)
         if self.lpu != "none":
             x = x + self._grid_conv(self.cpe1, x, H, W)
-        x = x + gate_msa.unsqueeze(1) * self.mixer(
-            modulate(self.norm1(x), shift_msa, scale_msa), H, W)
+        u = modulate(self.norm1(x), shift_msa, scale_msa)
+        if self.grad_checkpoint and torch.is_grad_enabled():
+            mix = torch.utils.checkpoint.checkpoint(self.mixer, u, H, W, use_reentrant=False)
+        else:
+            mix = self.mixer(u, H, W)
+        x = x + gate_msa.unsqueeze(1) * mix
         if self.lpu != "none":
             x = x + self._grid_conv(self.cpe2, x, H, W)
         h = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -380,6 +390,9 @@ class JiTSpatialMamba(nn.Module):
         #   d_state > 1 only: SASF kernels "shared" by a channel's N state maps,
         #   or one set "per_state" (see StructureAwareSSM)
         sasf_state_kernels: str = "shared",
+        #   recompute each mixer in the backward pass (activation checkpointing):
+        #   same model and maths, less memory, more compute
+        grad_checkpoint: bool = False,
         # FFN variant (same choices as JiTVMamba)
         ffn: str = "swiglu",
     ):
@@ -399,6 +412,7 @@ class JiTSpatialMamba(nn.Module):
         self.gate = bool(gate)
         self.d_state = d_state
         self.sasf_state_kernels = sasf_state_kernels
+        self.grad_checkpoint = bool(grad_checkpoint)
         self.sasf_dilations = tuple(sasf_dilations)
         self.in_channels  = in_channels
         self.out_channels = in_channels
@@ -428,7 +442,7 @@ class JiTSpatialMamba(nn.Module):
                 hidden_size, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 d_state=d_state, d_conv=d_conv, expand=expand, gate=gate,
                 sasf_dilations=sasf_dilations, lpu=lpu,
-                sasf_state_kernels=sasf_state_kernels,
+                sasf_state_kernels=sasf_state_kernels, grad_checkpoint=grad_checkpoint,
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 ffn=ffn,

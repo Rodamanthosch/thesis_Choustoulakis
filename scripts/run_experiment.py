@@ -142,6 +142,7 @@ def build_model(cfg):
             sasf_dilations=tuple(m.get("sasf_dilations", (1, 3, 5))),
             lpu=m.get("lpu", "none"),
             sasf_state_kernels=m.get("sasf_state_kernels", "shared"),
+            grad_checkpoint=m.get("grad_checkpoint", False),
             ffn=m.get("ffn", "swiglu"),
         )
     elif arch == "vmamba2":

@@ -296,7 +296,7 @@ torchrun --nproc_per_node=8 scripts/run_experiment.py \
 or the one-shot launcher (environment, dependencies and `torchrun`; edit `DATA_DIR` at the top first):
 
 ```bash
-bash scripts/run_imagenet.sh <jit|vim|vmamba> [N_GPUS] [EPOCHS]
+bash scripts/run_imagenet.sh <jit|vim|vmamba|spatial|vmamba2|sasf> [N_GPUS] [EPOCHS]
 ```
 
 ### Reproduce JiT-B from the paper (Table 9)

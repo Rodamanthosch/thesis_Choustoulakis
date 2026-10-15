@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_imagenet.sh — one-shot large-scale ImageNet training (JiT / ViM / VMamba)
+# run_imagenet.sh — one-shot large-scale ImageNet training
+#                   (JiT / ViM / VMamba / Spatial-Mamba / VMamba2 / VMamba+SASF)
 #
 # Sets up the environment + dependencies, then launches the training command
 # on a single node with N GPUs (DDP via torchrun — NOT DataParallel).
 #
 # Usage:
-#   bash scripts/run_imagenet.sh <jit|vim|vmamba> [N_GPUS] [EPOCHS]
+#   bash scripts/run_imagenet.sh <jit|vim|vmamba|spatial|vmamba2|sasf> [N_GPUS] [EPOCHS]
 # Examples:
 #   bash scripts/run_imagenet.sh jit              # JiT-S baseline, 8 GPUs, 100 ep
 #   bash scripts/run_imagenet.sh vim 8 100        # ViM baseline
 #   bash scripts/run_imagenet.sh vmamba 8 2       # VMamba, 2-epoch smoke test
+#   bash scripts/run_imagenet.sh vmamba2 8 100    # VMamba2 (Mamba-2 / SSD core, Triton)
 #
-# All three configs are BASELINE ("γραμμικό", adaLN only): no in-context, no
+# All six configs are BASELINE ("γραμμικό", adaLN only): no in-context, no
 # conv-state conditioning.
 # =============================================================================
 set -euo pipefail
 
-MODEL=${1:-jit}        # jit | vim | vmamba
+MODEL=${1:-jit}        # jit | vim | vmamba | spatial | vmamba2 | sasf
 N_GPUS=${2:-8}
 EPOCHS=${3:-100}
 
@@ -32,7 +34,10 @@ case "$MODEL" in
   jit)    CONFIG=configs/imagenet/jit-s-imagenet.yaml ;;
   vim)    CONFIG=configs/imagenet/jit-s2-vim-imagenet.yaml ;;
   vmamba) CONFIG=configs/imagenet/jit-s2-vmamba-imagenet.yaml ;;
-  *) echo "Usage: bash scripts/run_imagenet.sh <jit|vim|vmamba> [N_GPUS] [EPOCHS]"; exit 1 ;;
+  spatial) CONFIG=configs/imagenet/jit-s2-spatial-gate-imagenet.yaml ;;
+  vmamba2) CONFIG=configs/imagenet/jit-s2-vmamba2-imagenet.yaml ;;
+  sasf)   CONFIG=configs/imagenet/jit-s2-vmamba-sasf-imagenet.yaml ;;
+  *) echo "Usage: bash scripts/run_imagenet.sh <jit|vim|vmamba|spatial|vmamba2|sasf> [N_GPUS] [EPOCHS]"; exit 1 ;;
 esac
 
 echo "=============================================================="

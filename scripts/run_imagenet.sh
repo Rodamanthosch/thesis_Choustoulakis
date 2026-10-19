@@ -62,6 +62,10 @@ if ! python -c "import mamba_ssm, causal_conv1d" 2>/dev/null; then
   CAUSAL_CONV1D_FORCE_BUILD=TRUE pip install -q --no-build-isolation causal-conv1d
   MAMBA_FORCE_BUILD=TRUE         pip install -q --no-build-isolation mamba-ssm
   pip install -q fvcore pyyaml torch-fidelity
+  # LTH14's fork (adds fid_statistics_file), pinned as in src/utils.py; the
+  # ImageNet FID needs it. --no-deps keeps the torch already installed.
+  pip install -q --force-reinstall --no-deps \
+    "git+https://github.com/LTH14/torch-fidelity.git@bfe72b995473e4fee9351705d7b005f17442a4ca"
   # fix a stale transformers import inside mamba_ssm (if present)
   python - <<'PY'
 import glob

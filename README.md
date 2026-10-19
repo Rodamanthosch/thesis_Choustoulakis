@@ -405,7 +405,7 @@ Results saved → experiments/cifar10/jit-s-baseline/eval/eval_results.json
 |---|---|---|
 | `--config` | required | Same config used for training |
 | `--checkpoint` | required | Path to `.pt` checkpoint |
-| `--n_samples` | 10000 | Samples for FID/IS — use 50000 for official |
+| `--n_samples` | 50000 ImageNet-1k, else 10000 | Samples for FID/IS |
 | `--batch_size` | 200 | Generation batch size |
 | `--ema` | 1 | Which EMA copy to use (1 or 2) |
 | `--cfg_scale` | from config | Override the CFG scale (for CFG sweeps) |
@@ -416,6 +416,8 @@ Results saved → experiments/cifar10/jit-s-baseline/eval/eval_results.json
 | `--out_dir` | next to checkpoint | Where to save results |
 
 Complexity comes from `src/flops_counter.py` (fvcore, with hooks for the selective scan, SDPA and causal conv that fvcore cannot trace). Its "GFLOPs" are **MACs**, the convention JiT / DiT / VMamba tables use; strict FLOPs are 2× that.
+
+**ImageNet-256/512 protocol** (official JiT, `engine_jit.py`): 50,000 samples, 50 per class, scored against JiT's precomputed statistics of the ADM-cropped ImageNet **train** set (`fid_stats/jit_in{256,512}_stats.npz`), with LTH14's `torch-fidelity` fork. `evaluate.py` selects it automatically for `dataset: imagenet`, `num_classes: 1000`, `input_size` 256 or 512; it downloads the stats (pinned commit, sha256-checked) and installs the fork (pinned commit) before sampling, and has no fallback, so the numbers stay comparable with the JiT paper.
 
 **Tiny-ImageNet protocol** (the conditioning results above): 10,000 samples, 50 per class, against the 10,000-image validation set; FID and IS from `torch-fidelity`; EMA 1; CFG 2.5 active for 0.1 < t < 1.0; 50 Heun steps.
 

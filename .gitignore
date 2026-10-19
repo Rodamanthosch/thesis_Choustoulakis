@@ -7,6 +7,8 @@
 # ── Datasets (download separately) ───────────────────────
 data/
 datasets/
+# LTH14/JiT FID reference stats, fetched by src/utils.py
+fid_stats/
 
 # ── Experiment outputs (keep metrics, ignore heavy files) ─
 experiments/*/samples/

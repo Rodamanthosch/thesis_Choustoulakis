@@ -233,6 +233,114 @@ def evaluate_fid_is(gen_dir: str, real_dir: str, device: str = "cuda", n_samples
     }
 
 
+# ── Official ImageNet FID / IS (exact from LTH14/JiT engine_jit.py) ──────────
+#
+# JiT scores 50K samples against PRECOMPUTED statistics (mu, sigma) of the
+# ADM-cropped ImageNet TRAIN set, with LTH14's torch-fidelity fork, whose only
+# functional change is the `fid_statistics_file` argument (input2=None). Both
+# the fork and the stats are pinned to a commit; the stats are sha256-checked.
+
+JIT_TORCH_FIDELITY = ("git+https://github.com/LTH14/torch-fidelity.git"
+                      "@bfe72b995473e4fee9351705d7b005f17442a4ca")
+JIT_STATS_URL = ("https://raw.githubusercontent.com/LTH14/JiT/"
+                 "cbc743a2ada5e9762697da2c83f8c4f8379e8c17/fid_stats/{}")
+JIT_FID_STATS = {   # img_size -> (file, sha256)
+    256: ("jit_in256_stats.npz",
+          "412046720c0d496dc6d72a30eac3e22b9ef6ddac3501cce7f996674ad227ba4c"),
+    512: ("jit_in512_stats.npz",
+          "cdd15b54f9d1f26a881fcdc920a3410fa7a934047d6c4f5b8395b87182a9ab42"),
+}
+FID_STATS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "fid_stats")
+
+
+def uses_jit_fid(cfg) -> bool:
+    """True when JiT's reference stats apply: ImageNet-1k at 256 or 512.
+    Tiny-ImageNet (200 classes, 64 px), CIFAR-10 and other ImageFolder
+    subsets keep the folder-based evaluate_fid_is."""
+    m = cfg["model"]
+    return (cfg["experiment"]["dataset"] == "imagenet"
+            and m["num_classes"] == 1000 and m["input_size"] in JIT_FID_STATS)
+
+
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def jit_fid_stats_path(img_size: int, stats_dir: str = FID_STATS_DIR) -> str:
+    """Path to JiT's reference stats for img_size, downloaded once (pinned
+    commit) and sha256-verified on every call."""
+    import urllib.request
+    fname, sha = JIT_FID_STATS[img_size]
+    path = os.path.join(stats_dir, fname)
+    if not os.path.exists(path):
+        os.makedirs(stats_dir, exist_ok=True)
+        print(f"Downloading {fname} (LTH14/JiT reference stats) -> {stats_dir}")
+        tmp = path + ".part"
+        urllib.request.urlretrieve(JIT_STATS_URL.format(fname), tmp)
+        os.replace(tmp, path)
+    got = _sha256(path)
+    if got != sha:
+        raise RuntimeError(f"{path}: sha256 {got} != expected {sha}. "
+                           f"Delete it to re-download.")
+    return path
+
+
+def _has_jit_torch_fidelity() -> bool:
+    try:
+        from torch_fidelity.defaults import DEFAULTS
+    except ImportError:
+        return False
+    return "fid_statistics_file" in DEFAULTS
+
+
+def ensure_jit_torch_fidelity():
+    """Import LTH14's torch-fidelity fork, installing the pinned commit over a
+    stock torch-fidelity if needed (--no-deps: never touches torch)."""
+    import importlib, subprocess, sys
+    if not _has_jit_torch_fidelity():
+        print(f"Installing LTH14/torch-fidelity ({JIT_TORCH_FIDELITY})")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                               "--force-reinstall", "--no-deps", JIT_TORCH_FIDELITY])
+        for name in [n for n in sys.modules
+                     if n == "torch_fidelity" or n.startswith("torch_fidelity.")]:
+            del sys.modules[name]
+        importlib.invalidate_caches()
+        if not _has_jit_torch_fidelity():
+            raise RuntimeError("torch-fidelity has no `fid_statistics_file`: the LTH14 "
+                               f"fork is required. pip install '{JIT_TORCH_FIDELITY}'")
+    import torch_fidelity
+    return torch_fidelity
+
+
+def evaluate_fid_is_jit(gen_dir: str, stats_path: str, device: str = "cuda"):
+    """FID / IS of gen_dir against JiT's reference stats, with the exact
+    calculate_metrics call of LTH14/JiT engine_jit.py evaluate(). No fallback:
+    a different tool would give numbers that are not comparable."""
+    torch_fidelity = ensure_jit_torch_fidelity()
+    metrics = torch_fidelity.calculate_metrics(
+        input1=gen_dir,
+        input2=None,
+        fid_statistics_file=stats_path,
+        cuda=(device == "cuda"),
+        isc=True,
+        fid=True,
+        kid=False,
+        prc=False,
+        verbose=False,
+    )
+    return {
+        "fid":     metrics["frechet_inception_distance"],
+        "is_mean": metrics["inception_score_mean"],
+        "is_std":  metrics["inception_score_std"],
+    }
+
+
 # ── Throughput measurement (from notebooks Cell 40) ──────────────────────────
 
 @torch.no_grad()

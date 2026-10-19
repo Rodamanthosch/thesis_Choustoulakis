@@ -35,6 +35,12 @@ PATCHES:
             as LTH14/JiT engine_jit.py evaluate() does (line 109). Default off
             (fp32 sampling, every earlier result); the ImageNet-256 configs
             turn it on. --sampling_amp 0|1 overrides the config.
+  JiT-FID — ImageNet-1k at 256/512 (src/utils.py uses_jit_fid) is scored as
+            LTH14/JiT engine_jit.py does: 50K samples by default, against the
+            precomputed train-set stats fid_stats/jit_in{256,512}_stats.npz,
+            with LTH14's torch-fidelity fork (both pinned, stats sha256-checked),
+            no fallback. No real-image folder is written. Tiny-ImageNet and
+            CIFAR-10 are unchanged (10K default, folder reference).
 """
 
 import argparse, os, sys, json
@@ -49,6 +55,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.train import Denoiser
 from src.utils import (
     load_config, load_checkpoint, evaluate_fid_is, measure_throughput, CenterCropArr,
+    uses_jit_fid, jit_fid_stats_path, ensure_jit_torch_fidelity, evaluate_fid_is_jit,
 )
 
 
@@ -152,7 +159,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",     required=True,  help="Path to YAML config")
     parser.add_argument("--checkpoint", required=True,  help="Path to .pt checkpoint")
-    parser.add_argument("--n_samples",  type=int, default=10000, help="Samples for FID/IS (50000 for official)")
+    parser.add_argument("--n_samples",  type=int, default=None,
+                        help="Samples for FID/IS (default: 50000 for ImageNet-1k, as JiT; "
+                             "10000 otherwise)")
     parser.add_argument("--batch_size", type=int, default=200,   help="Generation batch size")
     parser.add_argument("--ema",        type=int, default=1,     choices=[1, 2], help="Which EMA to use (1 or 2)")
     parser.add_argument("--out_dir",    default=None, help="Where to save results (default: next to checkpoint)")
@@ -193,6 +202,11 @@ def main():
     sampling_amp = bool(s_cfg.get("amp", False)) if args.sampling_amp is None \
         else bool(args.sampling_amp)
 
+    # ImageNet-1k 256/512: JiT's FID protocol (see JiT-FID above).
+    jit_fid = uses_jit_fid(cfg)
+    if args.n_samples is None:
+        args.n_samples = 50000 if jit_fid else 10000
+
     out_dir = args.out_dir or os.path.join(os.path.dirname(args.checkpoint), "eval")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -201,6 +215,7 @@ def main():
     print(f"  Checkpoint  : {args.checkpoint}")
     print(f"  EMA copy    : {args.ema}")
     print(f"  Samples     : {args.n_samples}")
+    print(f"  FID ref     : {'LTH14/JiT train-set stats (official)' if jit_fid else 'image folder'}")
     print(f"  CFG scale   : {c_cfg['cfg_scale']}")
     print(f"  CFG interval: {c_cfg['cfg_interval']}")
     print(f"  ODE steps   : {s_cfg['steps']}")
@@ -208,6 +223,13 @@ def main():
     print(f"  Seed        : {args.seed}")
     print(f"  Device      : {device}")
     print(f"{'='*60}\n")
+
+    # Fetch the stats and the torch-fidelity fork BEFORE sampling 50K images,
+    # so a download / install problem fails in seconds, not after hours.
+    if jit_fid and not args.skip_fid:
+        jit_stats = jit_fid_stats_path(m_cfg["input_size"])
+        ensure_jit_torch_fidelity()
+        print(f"✅ FID reference: {jit_stats} (sha256 ok)\n")
 
     # ── Build model + load checkpoint ────────────────────────────────────────
     net = build_model(cfg).to(device)
@@ -305,6 +327,22 @@ def main():
             pbar.update(bs)
         pbar.close()
     print(f"✅ {count} images saved to {gen_dir}\n")
+
+    # ── 3–4. ImageNet-1k: FID / IS against JiT's precomputed stats ───────────
+    if jit_fid:
+        print("── FID / IS (LTH14/JiT protocol) ───────────────────────────")
+        metrics = evaluate_fid_is_jit(gen_dir, jit_stats, device=device)
+        k = args.n_samples // 1000
+        print(f"  FID-{k}K  : {metrics['fid']:.2f}")
+        print(f"  IS-{k}K   : {metrics['is_mean']:.2f} ± {metrics['is_std']:.2f}")
+        results.update({
+            f"fid_{k}k":     round(metrics["fid"], 2),
+            f"is_mean_{k}k": round(metrics["is_mean"], 2),
+            f"is_std_{k}k":  round(metrics["is_std"], 2),
+            "fid_reference": os.path.basename(jit_stats),
+        })
+        _save_results(results, out_dir)
+        return
 
     # ── 3. Save real images ───────────────────────────────────────────────────
     # ─── BUG #3 FIX: save the FULL training set as FID reference, not a subset.

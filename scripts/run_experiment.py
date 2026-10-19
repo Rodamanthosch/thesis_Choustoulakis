@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.train import Denoiser
 from src.utils import (
     load_config, save_checkpoint, load_checkpoint,
-    paper_peak_lr, make_lr_fn, MetricLogger,
+    paper_peak_lr, make_lr_fn, MetricLogger, CenterCropArr,
 )
 
 
@@ -190,10 +190,12 @@ def build_dataset(cfg):
             transform=T.Compose([T.RandomHorizontalFlip(), T.ToTensor(), norm]),
         )
     elif dataset == "imagenet":
+        # LTH14/JiT main_jit.py: ADM center crop (BOX halving + BICUBIC), flip.
+        # ToTensor + Normalize(0.5, 0.5) is bit-identical to JiT's x/255*2-1.
         return torchvision.datasets.ImageFolder(
             root=os.path.join(data_dir, "train"),
             transform=T.Compose([
-                T.Resize(img_size), T.CenterCrop(img_size),
+                CenterCropArr(img_size),
                 T.RandomHorizontalFlip(), T.ToTensor(), norm,
             ]),
         )

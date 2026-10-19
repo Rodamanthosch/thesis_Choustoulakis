@@ -47,7 +47,9 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.train import Denoiser
-from src.utils import load_config, load_checkpoint, evaluate_fid_is, measure_throughput
+from src.utils import (
+    load_config, load_checkpoint, evaluate_fid_is, measure_throughput, CenterCropArr,
+)
 
 
 def build_model(cfg):
@@ -319,9 +321,9 @@ def main():
     elif dataset == "imagenet":
         real_ds = torchvision.datasets.ImageFolder(
             root=os.path.join(data_dir, "val"),
+            # Same ADM crop as training (run_experiment.py / LTH14/JiT).
             transform=T.Compose([
-                T.Resize(m_cfg["input_size"]),
-                T.CenterCrop(m_cfg["input_size"]),
+                CenterCropArr(m_cfg["input_size"]),
                 T.ToTensor(),
             ])
         )

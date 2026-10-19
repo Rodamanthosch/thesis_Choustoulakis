@@ -8,6 +8,7 @@ LR scheduler:       exact from all three notebooks (Cell 23 — identical in all
 FID/IS evaluation:  exact from all three notebooks (Cell 38 — identical in all).
 Config loading:     load YAML hyperparameter files from configs/.
 Throughput:         from the throughput cell (Cell 40) in all notebooks.
+ImageNet crop:      exact from LTH14/JiT util/crop.py (ADM center_crop_arr).
 """
 
 import os
@@ -16,7 +17,9 @@ import json
 import yaml
 from collections import OrderedDict
 
+import numpy as np
 import torch
+from PIL import Image
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -25,6 +28,42 @@ def load_config(path: str) -> dict:
     """Load a YAML config file and return as dict."""
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+# ── ImageNet crop (exact from LTH14/JiT util/crop.py) ─────────────────────────
+
+def center_crop_arr(pil_image, image_size):
+    """
+    Center cropping implementation from ADM.
+    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
+    """
+    while min(*pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(
+            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
+        )
+
+    scale = image_size / min(*pil_image.size)
+    pil_image = pil_image.resize(
+        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
+    )
+
+    arr = np.array(pil_image)
+    crop_y = (arr.shape[0] - image_size) // 2
+    crop_x = (arr.shape[1] - image_size) // 2
+    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+
+
+class CenterCropArr:
+    """center_crop_arr as a transform. JiT wraps it in T.Lambda(lambda ...); a
+    class pickles, so it also works with spawn-based DataLoader workers."""
+    def __init__(self, image_size):
+        self.image_size = image_size
+
+    def __call__(self, pil_image):
+        return center_crop_arr(pil_image, self.image_size)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(image_size={self.image_size})"
 
 
 # ── Checkpoint helpers (exact from notebooks Cell 25) ─────────────────────────

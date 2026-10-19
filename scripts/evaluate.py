@@ -41,6 +41,11 @@ PATCHES:
             with LTH14's torch-fidelity fork (both pinned, stats sha256-checked),
             no fallback. No real-image folder is written. Tiny-ImageNet and
             CIFAR-10 are unchanged (10K default, folder reference).
+  STALE-SAMPLES — eval/generated/ is shared by every checkpoint and CFG value
+            of a run and files were only overwritten, so a smaller --n_samples
+            after a larger one scored the leftovers too. Its PNGs are now
+            cleared before sampling, and scoring refuses to run unless the
+            folder holds exactly n_samples images.
 """
 
 import argparse, os, sys, json
@@ -153,6 +158,27 @@ def build_model(cfg):
         )
     else:
         raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba | spatial_mamba | vmamba2 | vmamba_sasf")
+
+
+# torch-fidelity scores every file with these extensions in the folder.
+IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+
+
+def clear_generated(gen_dir):
+    """Delete the PNGs an earlier evaluation left in gen_dir (this script is
+    the folder's only writer). Returns how many were removed."""
+    stale = [f for f in os.listdir(gen_dir) if f.lower().endswith(".png")]
+    for f in stale:
+        os.remove(os.path.join(gen_dir, f))
+    return len(stale)
+
+
+def check_generated(gen_dir, n_samples):
+    """FID/IS read the whole folder: it must hold exactly this run's images."""
+    n = sum(f.lower().endswith(IMAGE_EXTS) for f in os.listdir(gen_dir))
+    if n != n_samples:
+        raise RuntimeError(f"{gen_dir} holds {n} images, expected {n_samples}: "
+                           f"FID/IS would score images from another run.")
 
 
 def main():
@@ -297,6 +323,9 @@ def main():
     real_dir = os.path.join(out_dir, "real")
     os.makedirs(gen_dir, exist_ok=True)
     os.makedirs(real_dir, exist_ok=True)
+    n_stale = clear_generated(gen_dir)
+    if n_stale:
+        print(f"  Removed {n_stale} images left in {gen_dir} by an earlier evaluation")
 
     # ─── BUG #8 FIX: equal-per-class labels (matches engine_jit.py) ──────────
     num_classes = m_cfg["num_classes"]
@@ -327,6 +356,7 @@ def main():
             pbar.update(bs)
         pbar.close()
     print(f"✅ {count} images saved to {gen_dir}\n")
+    check_generated(gen_dir, args.n_samples)
 
     # ── 3–4. ImageNet-1k: FID / IS against JiT's precomputed stats ───────────
     if jit_fid:

@@ -405,7 +405,7 @@ Results saved → experiments/cifar10/jit-s-baseline/eval/eval_results.json
 |---|---|---|
 | `--config` | required | Same config used for training |
 | `--checkpoint` | required | Path to `.pt` checkpoint |
-| `--n_samples` | 50000 ImageNet-1k, else 10000 | Samples for FID/IS |
+| `--n_samples` | config `sampling.n_samples`, else 50000 ImageNet-1k / 10000 | Samples for FID/IS |
 | `--batch_size` | 200 | Generation batch size |
 | `--ema` | 1 | Which EMA copy to use (1 or 2) |
 | `--cfg_scale` | from config | Override the CFG scale (for CFG sweeps) |

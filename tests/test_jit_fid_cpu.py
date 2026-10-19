@@ -234,7 +234,7 @@ for node in ast.walk(tree):
             and node.args and getattr(node.args[0], "value", None) == "--n_samples"):
         n_default = next(k.value for k in node.keywords if k.arg == "default")
 assert isinstance(n_default, ast.Constant) and n_default.value is None
-assert "args.n_samples = 50000 if jit_fid else 10000" in src
+assert 'args.n_samples = s_cfg.get("n_samples") or (50000 if jit_fid else 10000)' in src
 for name in ("uses_jit_fid(cfg)", "jit_fid_stats_path(", "ensure_jit_torch_fidelity()",
              "evaluate_fid_is_jit(gen_dir, jit_stats"):
     assert name in src, name

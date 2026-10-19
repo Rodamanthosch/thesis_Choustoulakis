@@ -186,8 +186,8 @@ def main():
     parser.add_argument("--config",     required=True,  help="Path to YAML config")
     parser.add_argument("--checkpoint", required=True,  help="Path to .pt checkpoint")
     parser.add_argument("--n_samples",  type=int, default=None,
-                        help="Samples for FID/IS (default: 50000 for ImageNet-1k, as JiT; "
-                             "10000 otherwise)")
+                        help="Samples for FID/IS (default: config sampling.n_samples, else "
+                             "50000 for ImageNet-1k, as JiT; 10000 otherwise)")
     parser.add_argument("--batch_size", type=int, default=200,   help="Generation batch size")
     parser.add_argument("--ema",        type=int, default=1,     choices=[1, 2], help="Which EMA to use (1 or 2)")
     parser.add_argument("--out_dir",    default=None, help="Where to save results (default: next to checkpoint)")
@@ -230,8 +230,9 @@ def main():
 
     # ImageNet-1k 256/512: JiT's FID protocol (see JiT-FID above).
     jit_fid = uses_jit_fid(cfg)
+    # --n_samples > config sampling.n_samples > protocol default
     if args.n_samples is None:
-        args.n_samples = 50000 if jit_fid else 10000
+        args.n_samples = s_cfg.get("n_samples") or (50000 if jit_fid else 10000)
 
     out_dir = args.out_dir or os.path.join(os.path.dirname(args.checkpoint), "eval")
     os.makedirs(out_dir, exist_ok=True)

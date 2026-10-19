@@ -33,7 +33,7 @@ OUT_ROOT=$HOME/experiments/imagenet
 case "$MODEL" in
   jit)    CONFIG=configs/imagenet/jit-s-imagenet.yaml ;;
   vim)    CONFIG=configs/imagenet/jit-s2-vim-imagenet.yaml ;;
-  vmamba) CONFIG=configs/imagenet/jit-s2-vmamba-imagenet.yaml ;;
+  vmamba) CONFIG=configs/imagenet/jit-s16-vmamba-imagenet.yaml ;;
   spatial) CONFIG=configs/imagenet/jit-s2-spatial-gate-imagenet.yaml ;;
   vmamba2) CONFIG=configs/imagenet/jit-s2-vmamba2-imagenet.yaml ;;
   sasf)   CONFIG=configs/imagenet/jit-s2-vmamba-sasf-imagenet.yaml ;;

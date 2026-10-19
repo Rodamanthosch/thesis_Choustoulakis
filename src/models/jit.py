@@ -208,11 +208,15 @@ class JiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size),
                                        requires_grad=False)
 
-        # in-context positional embeddings (only if in_context_len > 0)
+        # in-context positional embeddings (only if in_context_len > 0).
+        # N(0, 0.02) as in LTH14/JiT model_jit.py: a zero init leaves the K
+        # class tokens identical, and attention (no RoPE on them) can never
+        # tell them apart, so they would stay K copies of one token for good.
         if in_context_len > 0:
             self.incontext_pos_embed = nn.Parameter(
                 torch.zeros(1, in_context_len, hidden_size)
             )
+            nn.init.normal_(self.incontext_pos_embed, std=0.02)
 
         # 2D RoPE — TWO instances to match LTH14/JiT model_jit.py exactly:
         #   feat_rope (num_cls_token=0)        — used by blocks before in_context_start

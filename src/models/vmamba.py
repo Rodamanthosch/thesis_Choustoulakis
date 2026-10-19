@@ -710,6 +710,7 @@ class JiTVMamba(nn.Module):
             self.incontext_pos_embed = nn.Parameter(
                 torch.zeros(1, in_context_len, hidden_size)
             )
+            nn.init.normal_(self.incontext_pos_embed, std=0.02)   # LTH14/JiT init
 
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)

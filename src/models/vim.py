@@ -541,12 +541,14 @@ class JiTViM(nn.Module):
         )
 
         # Learnable positional slots for the in-context tokens (option A).
-        # Matches jit.py exactly: zeros-initialised, learnable, only the patch
-        # grid uses the fixed sin-cos table so baseline positions are unchanged.
+        # Matches jit.py exactly: N(0, 0.02)-initialised (LTH14/JiT), learnable,
+        # only the patch grid uses the fixed sin-cos table so baseline
+        # positions are unchanged.
         if in_context_len > 0:
             self.incontext_pos_embed = nn.Parameter(
                 torch.zeros(1, in_context_len, hidden_size)
             )
+            nn.init.normal_(self.incontext_pos_embed, std=0.02)
 
         # Middle-half dropout slot, matching your original structure.
         lo, hi = depth // 4, depth // 4 * 3

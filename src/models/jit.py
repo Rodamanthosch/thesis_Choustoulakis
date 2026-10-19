@@ -92,7 +92,28 @@ class VisionRotaryEmbeddingFast(nn.Module):
 
 
 # ── Attention ─────────────────────────────────────────────────────────────────
-# Exact from jit-cifar10 Cell 9.
+# Exact from jit-cifar10 Cell 9, with LTH14/JiT's attention kernel.
+
+def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
+    """LTH14/JiT model_jit.py, verbatim except two device fixes: the zero
+    attn_bias is made on query's device (was .cuda()), and autocast is turned
+    off for query's device type (was the deprecated torch.cuda.amp.autocast).
+
+    QK^T and the softmax run in fp32 even under bf16 autocast. q and k reach
+    here in fp32 (RoPE multiplies by fp32 tables), so the logits use them
+    unrounded, where F.scaled_dot_product_attention would cast q, k to bf16.
+    """
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1))
+    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype, device=query.device)
+
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
+
 
 class Attention(nn.Module):
     """QK-Norm attention with 2D RoPE (applied externally via `rope` callable)."""
@@ -117,8 +138,8 @@ class Attention(nn.Module):
         k = self.k_norm(k)
         q = rope(q)
         k = rope(k)
-        x = F.scaled_dot_product_attention(q, k, v,
-                                            dropout_p=self.attn_drop.p if self.training else 0.0)
+        x = scaled_dot_product_attention(q, k, v,
+                                         dropout_p=self.attn_drop.p if self.training else 0.0)
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)

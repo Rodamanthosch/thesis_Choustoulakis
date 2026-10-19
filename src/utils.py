@@ -107,6 +107,28 @@ def save_checkpoint(path, epoch, global_step, denoiser, optimizer, losses, best_
     torch.save(payload, path)
 
 
+def _regroup_optimizer_state(saved, optimizer, saved_params):
+    """Map an optimizer state saved with ONE param group over
+    net.parameters() (checkpoints from before add_weight_decay) onto the
+    optimizer's current groups. Per-parameter state (Adam moments, step) is
+    carried over by parameter identity; the group hyperparameters come from
+    the current optimizer (lr is set again every step)."""
+    assert len(saved["param_groups"]) == 1 and \
+        saved["param_groups"][0]["params"] == list(range(len(saved_params))), \
+        "unexpected optimizer state layout"
+    old_index = {id(p): i for i, p in enumerate(saved_params)}
+    regrouped = optimizer.state_dict()       # params numbered 0.. in group order
+    state, new_i = {}, 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            i = old_index[id(p)]
+            if i in saved["state"]:
+                state[new_i] = saved["state"][i]
+            new_i += 1
+    regrouped["state"] = state
+    return regrouped
+
+
 def load_checkpoint(path, denoiser, optimizer=None, map_location=None):
     payload = torch.load(path, map_location=map_location or "cpu", weights_only=False)
     denoiser.net.load_state_dict(payload["model"])
@@ -115,8 +137,29 @@ def load_checkpoint(path, denoiser, optimizer=None, map_location=None):
     if payload.get("ema2") is not None:
         _load_ema_from_state_dict(denoiser, payload["ema2"], 2)
     if optimizer is not None and "optimizer" in payload:
-        optimizer.load_state_dict(payload["optimizer"])
+        saved = payload["optimizer"]
+        if len(saved["param_groups"]) != len(optimizer.param_groups):
+            saved = _regroup_optimizer_state(saved, optimizer,
+                                             list(denoiser.net.parameters()))
+        optimizer.load_state_dict(saved)
     return payload
+
+
+# ── Optimizer param groups (exact from LTH14/JiT util/misc.py) ────────────────
+
+def add_weight_decay(model, weight_decay=0, skip_list=()):
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue  # frozen weights
+        if len(param.shape) == 1 or name.endswith(".bias") or name in skip_list or 'diffloss' in name:
+            no_decay.append(param)  # no weight decay on bias, norm and diffloss
+        else:
+            decay.append(param)
+    return [
+        {'params': no_decay, 'weight_decay': 0.},
+        {'params': decay, 'weight_decay': weight_decay}]
 
 
 # ── LR scheduler (exact from notebooks Cell 23) ──────────────────────────────

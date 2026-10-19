@@ -24,9 +24,14 @@ PATCHES:
   BUG #4   — autocast dtype is bf16 (matches LTH14/JiT engine_jit.py)
              and GradScaler is removed (bf16 doesn't need it).
   BUG #15  — num_workers bumped from 4 to 12 (matches LTH14/JiT main_jit.py).
+  JiT-OPT  — LTH14/JiT optimizer + loop details: add_weight_decay param
+             groups (no decay on biases / norms; identical maths at
+             weight_decay 0; old single-group checkpoints still resume, see
+             src/utils.py _regroup_optimizer_state), and training stops on a
+             non-finite loss before the update, as engine_jit.py does.
 """
 
-import argparse, os, sys, yaml
+import argparse, math, os, sys, yaml
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -40,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.train import Denoiser
 from src.utils import (
     load_config, save_checkpoint, load_checkpoint,
-    paper_peak_lr, make_lr_fn, MetricLogger, CenterCropArr,
+    paper_peak_lr, make_lr_fn, MetricLogger, CenterCropArr, add_weight_decay,
 )
 
 
@@ -263,10 +268,12 @@ def main():
     )
     denoiser.init_ema()
 
-    # Optimizer on DDP net so gradients sync across GPUs
+    # LTH14/JiT main_jit.py: no weight decay on biases / norms / 1-D params,
+    # frozen params (pos_embed) left out. raw_net's parameters ARE the DDP
+    # net's, so gradients still sync across GPUs.
+    param_groups = add_weight_decay(raw_net, t_cfg["weight_decay"])
     optimizer = torch.optim.AdamW(
-        net.parameters(), lr=peak_lr,
-        betas=tuple(t_cfg["betas"]), weight_decay=t_cfg["weight_decay"],
+        param_groups, lr=peak_lr, betas=tuple(t_cfg["betas"]),
     )
 
     # ── Data ───────────────────────────────────────────────────────────────────
@@ -331,12 +338,18 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     loss = denoiser(images, labels)
-                loss.backward()
-                optimizer.step()
             else:
                 loss = denoiser(images, labels)
-                loss.backward()
-                optimizer.step()
+
+            # LTH14/JiT engine_jit.py: stop on a non-finite loss BEFORE the
+            # update, so no NaN step is taken and no broken checkpoint saved.
+            loss_value = loss.item()
+            if not math.isfinite(loss_value):
+                print("Loss is {}, stopping training".format(loss_value))
+                sys.exit(1)
+
+            loss.backward()
+            optimizer.step()
             # ──────────────────────────────────────────────────────────────────────
 
             # EMA only on main process (tracks raw_net weights)
@@ -344,9 +357,9 @@ def main():
                 denoiser.update_ema()
 
             global_step += 1
-            epoch_loss  += loss.item()
+            epoch_loss  += loss_value
             if main_proc:
-                pbar.set_postfix(loss=f"{loss.item():.4f}",
+                pbar.set_postfix(loss=f"{loss_value:.4f}",
                                  lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
         # ── Logging + checkpointing (main process only) ──────────────────────

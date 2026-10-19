@@ -429,7 +429,9 @@ def print_report(
     conv1d_op = "PythonOp.CausalConv1dFn"
 
     ssm_total = sum(by_op.get(op, 0) for op in ssm_ops)
-    sdpa_total = by_op.get(sdpa_op, 0)
+    # Fused SDPA needs the custom hook; JiT's own attention (LTH14/JiT kernel:
+    # explicit QK^T and attn·V matmuls) is counted by fvcore natively.
+    sdpa_total = by_op.get(sdpa_op, 0) + by_op.get("matmul", 0)
     conv1d_total = by_op.get(conv1d_op, 0)
     linear_total = by_op.get("linear", 0)
     conv_total = by_op.get("conv", 0)
@@ -447,12 +449,12 @@ def print_report(
     elif sdpa_total > 0:
         arch = "Attention-based (JiT)"
         print(f"    Architecture detected     : {arch}")
-        print(f"    SDPA (attention) MACs     : {sdpa_total/1e9:>9.4f} G  ({100*sdpa_total/m:.1f}%)")
+        print(f"    Attention MACs            : {sdpa_total/1e9:>9.4f} G  ({100*sdpa_total/m:.1f}%)")
         print(f"    Linear MACs (incl. QKV)   : {linear_total/1e9:>9.4f} G  ({100*linear_total/m:.1f}%)")
         print(f"    Conv (patch embed) MACs   : {conv_total/1e9:>9.4f} G  ({100*conv_total/m:.1f}%)")
         print()
-        print(f"    🟢 SDPA formula: 2·B·H·N²·d (QK^T + attn·V matmuls)")
-        print(f"       ⚠ WITHOUT this custom hook, fvcore silently misses this!")
+        print(f"    🟢 Attention formula: 2·B·H·N²·d (QK^T + attn·V matmuls)")
+        print(f"       explicit matmuls: counted by fvcore; fused SDPA: custom hook")
     else:
         print(f"    Architecture: unknown / mixed")
 

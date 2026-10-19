@@ -8,12 +8,16 @@ instead of zeros, in jit.py, vim.py and vmamba.py.
 Runs WITHOUT a GPU and WITHOUT mamba_ssm / causal_conv1d: both kernels are
 stubbed with faithful references.
 
+The reference is the fix's parent commit, PRE_FIX (zero init), not HEAD:
+once the fix is committed HEAD has the new init too.
+
 Checks:
-  A. in_context_len = 0 is BIT-IDENTICAL to HEAD for all three models at
+  A. in_context_len = 0 is BIT-IDENTICAL to PRE_FIX for all three models at
      construction time (same seed -> every state_dict tensor equal), so no
      baseline run changes, not even its random init.
-  B. in-context arms: only the init changed -- HEAD weights transplanted into
-     the new model give a bit-identical forward, with identical state_dict keys.
+  B. in-context arms: only the init changed -- PRE_FIX weights transplanted
+     into the new model give a bit-identical forward, with identical
+     state_dict keys.
   C. the new slots look like N(0, 0.02) and are pairwise distinct.
   D. why it matters (attention JiT): with zero slots the K in-context tokens
      leave the last block identical and get identical gradients, so they can
@@ -124,11 +128,14 @@ t_in = torch.rand(Bsz)
 y_in = torch.randint(0, COMMON["num_classes"], (Bsz,))
 
 
-def head_class(path, cls_name):
-    src = subprocess.run(["git", "show", f"HEAD:{path}"], cwd=REPO_ROOT,
+PRE_FIX = "b59d6f0"     # parent of d64c543, the commit that introduced the N(0, 0.02) init
+
+
+def pre_fix_class(path, cls_name):
+    src = subprocess.run(["git", "show", f"{PRE_FIX}:{path}"], cwd=REPO_ROOT,
                          capture_output=True, check=True).stdout.decode("utf-8")
-    mod = types.ModuleType(f"head_{cls_name}")
-    exec(compile(src, f"<HEAD:{path}>", "exec"), mod.__dict__)
+    mod = types.ModuleType(f"prefix_{cls_name}")
+    exec(compile(src, f"<{PRE_FIX}:{path}>", "exec"), mod.__dict__)
     return getattr(mod, cls_name)
 
 
@@ -137,13 +144,13 @@ def build(cls, **kw):
     return cls(**kw).eval()
 
 
-HEAD = {name: head_class(path, cls_name)
-        for name, (path, cls_name, _, _) in MODELS.items()}
+OLD = {name: pre_fix_class(path, cls_name)
+       for name, (path, cls_name, _, _) in MODELS.items()}
 
 
-# ═══ A. in_context_len = 0: init and forward bit-identical to HEAD ═══════════
+# ═══ A. in_context_len = 0: init and forward bit-identical to PRE_FIX ═══════════
 for name, (_, _, cls, kw) in MODELS.items():
-    old, new = build(HEAD[name], **kw), build(cls, **kw)
+    old, new = build(OLD[name], **kw), build(cls, **kw)
     so, sn = old.state_dict(), new.state_dict()
     assert list(so) == list(sn), f"{name}: state_dict keys changed"
     for k in so:
@@ -151,7 +158,7 @@ for name, (_, _, cls, kw) in MODELS.items():
     with torch.no_grad():
         d = (old(x_img, t_in, y_in) - new(x_img, t_in, y_in)).abs().max().item()
     assert d == 0.0, f"{name}: baseline forward changed: {d}"
-print(f"A  in_context_len=0 bit-identical to HEAD (init + forward) for "
+print(f"A  in_context_len=0 bit-identical to PRE_FIX (init + forward) for "
       f"{', '.join(MODELS)}")
 
 
@@ -159,7 +166,7 @@ print(f"A  in_context_len=0 bit-identical to HEAD (init + forward) for "
 n_arms = 0
 for name, (_, _, cls, kw) in MODELS.items():
     for arm in ARMS[name]:
-        old, new = build(HEAD[name], **kw, **arm), build(cls, **kw, **arm)
+        old, new = build(OLD[name], **kw, **arm), build(cls, **kw, **arm)
         assert list(old.state_dict()) == list(new.state_dict()), \
             f"{name} {arm}: state_dict keys changed"
         assert not torch.equal(old.incontext_pos_embed, new.incontext_pos_embed)
@@ -168,15 +175,15 @@ for name, (_, _, cls, kw) in MODELS.items():
             d = (old(x_img, t_in, y_in) - new(x_img, t_in, y_in)).abs().max().item()
         assert d == 0.0, f"{name} {arm}: forward changed beyond init: {d}"
         n_arms += 1
-print(f"B  {n_arms} in-context arms: HEAD weights transplanted -> forward "
+print(f"B  {n_arms} in-context arms: {PRE_FIX} weights transplanted -> forward "
       f"bit-identical (max|diff| = 0.0)")
 
 
 # ═══ C. new slots ~ N(0, 0.02), pairwise distinct ════════════════════════════
 for name, (_, _, cls, kw) in MODELS.items():
     for arm in ARMS[name]:
-        old = build(HEAD[name], **kw, **arm)
-        assert torch.count_nonzero(old.incontext_pos_embed) == 0   # HEAD: zeros
+        old = build(OLD[name], **kw, **arm)
+        assert torch.count_nonzero(old.incontext_pos_embed) == 0   # PRE_FIX: zeros
         pe = build(cls, **kw, **arm).incontext_pos_embed.detach()[0]   # (K, D)
         std, mean = pe.std().item(), pe.mean().item()
         assert 0.015 < std < 0.025, f"{name} {arm}: std {std}"
@@ -224,7 +231,7 @@ so_new, sg_new = slot_spread(trained, K)
 assert so_old < 1e-5 and sg_old < 1e-5, (so_old, sg_old)
 assert so_new > 1e-2 and sg_new > 1e-2, (so_new, sg_new)
 print(f"D  jit K={K}, slot spread (relative)   output     grad")
-print(f"     zero slots (HEAD)            {so_old:9.2e} {sg_old:9.2e}   -> K copies of one token")
+print(f"     zero slots (old)             {so_old:9.2e} {sg_old:9.2e}   -> K copies of one token")
 print(f"     N(0, 0.02) slots (now)       {so_new:9.2e} {sg_new:9.2e}")
 
 print("\nALL CHECKS PASSED")

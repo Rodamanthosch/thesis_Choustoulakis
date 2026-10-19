@@ -15,6 +15,14 @@ PATCH: BUG #6 — CFG interval mask now uses the strict-on-low, strict-on-high
        form from LTH14/JiT denoiser.py:
            (t < high) & ((low == 0) | (t > low))
        (was: (t >= low) & (t <= high))
+
+PATCH: JiT-DENOISER — two more LTH14/JiT denoiser.py behaviours:
+  - labels are dropped only in training mode (self.training), so a loss
+    computed under .eval() sees the true labels;
+  - _forward_sample is denoiser.py's: a conditional and an unconditional
+    pass, each turned into v, mixed in v-space, at EVERY cfg_scale (was:
+    cfg_scale 1.0 skipped the unconditional pass; >1.0 mixed x in one doubled
+    batch). Same maths up to rounding; cfg 1.0 sampling now costs 2 passes.
 """
 
 import torch
@@ -26,9 +34,11 @@ class Denoiser(nn.Module):
     """
     JiT flow-matching denoiser.
 
-    Matches all three notebooks exactly when using default arguments:
+    Training matches all three notebooks exactly with default arguments:
         label_drop_prob = 0.0   (no CFG)
         cfg_scale       = 1.0   (no CFG)
+    Sampling follows LTH14/JiT denoiser.py (see JiT-DENOISER above): at
+    cfg_scale 1.0 it equals the conditional prediction up to rounding.
 
     Enable CFG:
         label_drop_prob = 0.1   (drop label 10% of time during training)
@@ -123,23 +133,27 @@ class Denoiser(nn.Module):
 
     # ── Training ──────────────────────────────────────────────────────────────
 
+    def drop_labels(self, labels):
+        drop = torch.rand(labels.shape[0], device=labels.device) < self.label_drop_prob
+        out = torch.where(drop, torch.full_like(labels, self.num_classes), labels)
+        return out
+
     def forward(self, x, labels):
         """
         v-loss for one batch.
-        Label dropout is applied when label_drop_prob > 0 (CFG training mode).
-        With label_drop_prob=0.0 this is identical to the notebook Denoiser.
+        Label dropout (CFG training) as in LTH14/JiT: training mode only.
+        label_drop_prob = 0 skips the draw (JiT draws and drops nothing), so
+        runs without CFG keep their exact random stream.
         """
-        # CFG label dropout
-        if self.label_drop_prob > 0.0:
-            drop = torch.rand(labels.shape[0], device=labels.device) < self.label_drop_prob
-            labels = torch.where(drop, torch.full_like(labels, self.num_classes), labels)
+        labels_dropped = self.drop_labels(labels) \
+            if self.training and self.label_drop_prob > 0.0 else labels
 
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
         e = torch.randn_like(x) * self.noise_scale
         z = t * x + (1 - t) * e
 
         v = (x - z) / (1 - t).clamp_min(self.t_eps)
-        x_pred = self.net(z, t.flatten(), labels)
+        x_pred = self.net(z, t.flatten(), labels_dropped)
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 
         loss = (v - v_pred) ** 2
@@ -179,44 +193,23 @@ class Denoiser(nn.Module):
 
     @torch.no_grad()
     def _forward_sample(self, z, t, labels):
-        """
-        Single model pass.
-        With cfg_scale=1.0 (default): conditional only, no CFG — matches notebooks exactly.
-        With cfg_scale>1.0: runs conditional + unconditional pass and applies guidance.
-        """
-        if self.cfg_scale == 1.0:
-            # No CFG — exact notebook behaviour
-            x_pred = self.net(z, t.flatten(), labels)
-            return (x_pred - z) / (1.0 - t).clamp_min(self.t_eps)
+        """Verbatim LTH14/JiT denoiser.py: conditional and unconditional pass,
+        CFG in v-space, at every cfg_scale (1.0 included).
+        t: (bsz, 1, 1, 1), as generate() slices it from `timesteps`."""
+        # conditional
+        x_cond = self.net(z, t.flatten(), labels)
+        v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
 
-        # CFG: run conditional and unconditional in one doubled batch
-        t_flat = t.flatten()
-        bsz = z.shape[0]
-        z_double = torch.cat([z, z], dim=0)
-        t_double = torch.cat([t_flat, t_flat], dim=0)
-        y_null   = torch.full_like(labels, self.num_classes)
-        y_double = torch.cat([labels, y_null], dim=0)
+        # unconditional
+        x_uncond = self.net(z, t.flatten(), torch.full_like(labels, self.num_classes))
+        v_uncond = (x_uncond - z) / (1.0 - t).clamp_min(self.t_eps)
 
-        x_pred_double = self.net(z_double, t_double, y_double)
-        x_cond, x_uncond = x_pred_double[:bsz], x_pred_double[bsz:]
-
-        # ─── BUG #6 FIX: CFG interval mask now matches LTH14/JiT denoiser.py ──
-        # Reference:  (t < high) & ((low == 0) | (t > low))
-        # Was:        (t >= low) & (t <= high)
+        # cfg interval
         low, high = self.cfg_interval
-        t_scalar = t_flat.view(bsz, 1, 1, 1)
-        if low == 0:
-            in_interval = (t_scalar < high)
-        else:
-            in_interval = (t_scalar < high) & (t_scalar > low)
-        # ──────────────────────────────────────────────────────────────────────
-        scale = torch.where(in_interval,
-                             torch.full_like(t_scalar, self.cfg_scale),
-                             torch.ones_like(t_scalar))
+        interval_mask = (t < high) & ((low == 0) | (t > low))
+        cfg_scale_interval = torch.where(interval_mask, self.cfg_scale, 1.0)
 
-        x_guided = x_uncond + scale * (x_cond - x_uncond)
-        t_view = t.view(bsz, *([1] * (z.ndim - 1)))
-        return (x_guided - z) / (1.0 - t_view).clamp_min(self.t_eps)
+        return v_uncond + cfg_scale_interval * (v_cond - v_uncond)
 
     @torch.no_grad()
     def _euler_step(self, z, t, t_next, labels):

@@ -325,14 +325,14 @@ print("E  old single-group checkpoint -> load_checkpoint into the grouped AdamW;
 # ═══ F. non-finite loss stops before the update ════════════════════════════════
 src = open(os.path.join(REPO_ROOT, "scripts", "run_experiment.py"), encoding="utf-8").read()
 loop = src[src.index("for images, labels in pbar:"):]
-i_fwd = loop.index("loss = denoiser(images, labels)")
+i_fwd = loop.index("loss = model(images, labels)")
 i_chk = loop.index("if not math.isfinite(loss_value):")
 i_exit = loop.index("sys.exit(1)")
 i_bwd = loop.index("loss.backward()")
 i_step = loop.index("optimizer.step()")
 assert i_fwd < i_chk < i_exit < i_bwd < i_step
-assert "loss = denoiser(images, labels)\n                loss.backward()" not in loop
-assert "add_weight_decay(raw_net" in src and "net.parameters(), lr=peak_lr" not in src
+assert "loss = model(images, labels)\n                loss.backward()" not in loop
+assert "add_weight_decay(net, " in src and "net.parameters(), lr=peak_lr" not in src
 print("F  run_experiment.py: forward -> isfinite check -> exit, before backward/step; "
       "optimizer built from add_weight_decay")
 

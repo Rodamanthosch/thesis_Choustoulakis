@@ -29,6 +29,12 @@ PATCHES:
              weight_decay 0; old single-group checkpoints still resume, see
              src/utils.py _regroup_optimizer_state), and training stops on a
              non-finite loss before the update, as engine_jit.py does.
+  DDP-SYNC — multi-GPU runs never averaged gradients: DDP wrapped the bare
+             net, but training called the Denoiser, which held the unwrapped
+             net, so DDP's forward (which arms the all-reduce) never ran and
+             every GPU trained its own model. Now, as in main_jit.py, DDP
+             wraps the whole Denoiser and training calls the wrapper. One
+             process (plain `python`, no torchrun): no wrapper, unchanged.
 """
 
 import argparse, math, os, sys, yaml
@@ -68,6 +74,16 @@ def setup_distributed():
 def cleanup():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def wrap_ddp(denoiser, world_size, device_ids=None):
+    """LTH14/JiT main_jit.py: DDP wraps the whole Denoiser and training calls
+    the wrapper. DDP only all-reduces gradients for a forward that goes
+    through its own forward(); calling a module it wraps skips the sync.
+    One process: no wrapper, the Denoiser itself."""
+    if world_size == 1:
+        return denoiser
+    return DDP(denoiser, device_ids=device_ids)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -248,16 +264,11 @@ def main():
     if main_proc:
         print(f"Parameters: {sum(p.numel() for p in net.parameters())/1e6:.2f} M")
 
-    # Wrap in DDP for multi-GPU
-    if world_size > 1:
-        net = DDP(net, device_ids=[local_rank])
-
-    raw_net = net.module if world_size > 1 else net
     peak_lr = paper_peak_lr(t_cfg["batch_size"], t_cfg["blr"])
 
-    # Denoiser holds EMA of the raw (non-DDP) net
+    # Denoiser holds the net, its EMA and the flow maths
     denoiser = Denoiser(
-        net=raw_net, img_size=cfg["model"]["input_size"],
+        net=net, img_size=cfg["model"]["input_size"],
         num_classes=cfg["model"]["num_classes"],
         P_mean=d_cfg["P_mean"], P_std=d_cfg["P_std"],
         t_eps=d_cfg["t_eps"], noise_scale=d_cfg["noise_scale"],
@@ -266,12 +277,15 @@ def main():
         label_drop_prob=c_cfg["label_drop_prob"], cfg_scale=c_cfg["cfg_scale"],
         cfg_interval=tuple(c_cfg["cfg_interval"]),
     )
+    # Multi-GPU: DDP around the whole Denoiser (DDP-SYNC above). Its
+    # constructor copies rank 0's weights to every rank, so the EMA starts
+    # after it, from the synchronised weights.
+    model = wrap_ddp(denoiser, world_size, [local_rank])
     denoiser.init_ema()
 
     # LTH14/JiT main_jit.py: no weight decay on biases / norms / 1-D params,
-    # frozen params (pos_embed) left out. raw_net's parameters ARE the DDP
-    # net's, so gradients still sync across GPUs.
-    param_groups = add_weight_decay(raw_net, t_cfg["weight_decay"])
+    # frozen params (pos_embed) left out.
+    param_groups = add_weight_decay(net, t_cfg["weight_decay"])
     optimizer = torch.optim.AdamW(
         param_groups, lr=peak_lr, betas=tuple(t_cfg["betas"]),
     )
@@ -320,7 +334,7 @@ def main():
         if sampler is not None:
             sampler.set_epoch(epoch)  # different shuffle per epoch in DDP
 
-        net.train()
+        model.train()
         epoch_loss = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{t_cfg['epochs']}",
                     leave=False, disable=not main_proc)
@@ -337,9 +351,9 @@ def main():
             # Matches LTH14/JiT engine_jit.py line 33-35 exactly.
             if use_amp:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    loss = denoiser(images, labels)
+                    loss = model(images, labels)
             else:
-                loss = denoiser(images, labels)
+                loss = model(images, labels)
 
             # LTH14/JiT engine_jit.py: stop on a non-finite loss BEFORE the
             # update, so no NaN step is taken and no broken checkpoint saved.
@@ -352,7 +366,7 @@ def main():
             optimizer.step()
             # ──────────────────────────────────────────────────────────────────────
 
-            # EMA only on main process (tracks raw_net weights)
+            # EMA only on main process (tracks the unwrapped Denoiser's weights)
             if main_proc:
                 denoiser.update_ema()
 

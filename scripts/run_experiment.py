@@ -35,6 +35,17 @@ PATCHES:
              every GPU trained its own model. Now, as in main_jit.py, DDP
              wraps the whole Denoiser and training calls the wrapper. One
              process (plain `python`, no torchrun): no wrapper, unchanged.
+  RNG-RESUME — the seed is set once at start-up and checkpoints held no RNG
+             state, so every resumed job replayed the run's first epochs
+             exactly (data order, flips, t, noise, label drops). Checkpoints
+             now carry every rank's RNG state at the epoch boundary and a
+             resume restores it: a resumed run continues exactly like an
+             uninterrupted one. Also: checkpoints are written via .tmp +
+             rename (a kill mid-write keeps the previous file), best_loss is
+             updated before saving (checkpoint-last carries it), metrics.json
+             is written every epoch and resumed, a missing resume_from warns
+             loudly, and training.num_workers (default 12) sets the loader
+             workers.
 """
 
 import argparse, math, os, sys, yaml
@@ -52,6 +63,7 @@ from src.train import Denoiser
 from src.utils import (
     load_config, save_checkpoint, load_checkpoint,
     paper_peak_lr, make_lr_fn, MetricLogger, CenterCropArr, add_weight_decay,
+    gather_rng_states, restore_rng_states,
 )
 
 
@@ -247,7 +259,8 @@ def main():
     s_cfg  = cfg["sampling"]
     ck_cfg = cfg["checkpoint"]
 
-    torch.manual_seed(cfg["experiment"].get("seed", 42) + rank)
+    seed = cfg["experiment"].get("seed", 42)
+    torch.manual_seed(seed + rank)
 
     if main_proc:
         print(f"\n{'='*60}")
@@ -300,7 +313,8 @@ def main():
         shuffle     = (sampler is None),
         sampler     = sampler,
         # ─── BUG #15 FIX: num_workers=12 matches LTH14/JiT main_jit.py ───
-        num_workers = 12,
+        # training.num_workers overrides it (match the CPU cores you get).
+        num_workers = t_cfg.get("num_workers", 12),
         # ────────────────────────────────────────────────────────────────
         pin_memory  = True,
         drop_last   = True,
@@ -317,17 +331,25 @@ def main():
 
     # ── Resume ─────────────────────────────────────────────────────────────────
     start_epoch, global_step, losses, best_loss = 1, 0, [], float("inf")
+    logger = MetricLogger()
     resume = ck_cfg.get("resume_from")
+    if resume and not os.path.exists(resume) and main_proc:
+        print(f"\n⚠ WARNING: checkpoint.resume_from = {resume} does not exist -> "
+              f"TRAINING FROM SCRATCH.\n  Expected only for the first job of a chain; "
+              f"otherwise check the path before checkpoint-last.pt is overwritten.\n")
     if resume and os.path.exists(resume):
         payload     = load_checkpoint(resume, denoiser, optimizer=optimizer, map_location=device)
         start_epoch = payload["epoch"] + 1
         global_step = payload["global_step"]
         losses      = payload["losses"]
         best_loss   = payload.get("best_loss", float("inf"))
+        logger.history = list(payload.get("metrics", []))
+        # LAST thing before the loop: continue the random stream exactly
+        # where the checkpoint left it (see RNG-RESUME).
+        exact = restore_rng_states(payload.get("rng"), rank, world_size, seed, start_epoch)
         if main_proc:
-            print(f"Resumed from {resume} (epoch {start_epoch}, step {global_step})\n")
-
-    logger = MetricLogger()
+            print(f"Resumed from {resume} (epoch {start_epoch}, step {global_step}); "
+                  f"RNG {'restored exactly' if exact else 'not in checkpoint -> reseeded from (seed, rank, epoch)'}\n")
 
     # ── Training loop ──────────────────────────────────────────────────────────
     for epoch in range(start_epoch, t_cfg["epochs"] + 1):
@@ -376,27 +398,40 @@ def main():
                 pbar.set_postfix(loss=f"{loss_value:.4f}",
                                  lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
+        # RNG state at the epoch boundary, from every rank (a collective under
+        # DDP, so outside main_proc). Nothing below draws random numbers before
+        # the next epoch's DataLoader iterator, so a resume from here continues
+        # exactly like the uninterrupted run.
+        rng_states = gather_rng_states(world_size)
+
         # ── Logging + checkpointing (main process only) ──────────────────────
         if main_proc:
             avg = epoch_loss / len(loader)
             losses.append(avg)
+            # best_loss is updated BEFORE any save, so checkpoint-last carries
+            # it: a resumed run must not overwrite checkpoint-best with a worse
+            # epoch.
+            is_best = avg < best_loss
+            if is_best:
+                best_loss = avg
             logger.log(epoch, loss=avg, lr=optimizer.param_groups[0]["lr"])
+            logger.save(f"{out_dir}/metrics.json", quiet=True)   # every epoch
             msg = f"Epoch {epoch:3d}/{t_cfg['epochs']} | v-loss {avg:.4f}"
+            ckpt = dict(rng_states=rng_states, metrics=logger.history)
 
             if epoch % ck_cfg["save_last_freq"] == 0 or epoch == t_cfg["epochs"]:
                 save_checkpoint(f"{out_dir}/checkpoint-last.pt",
-                                epoch, global_step, denoiser, optimizer, losses, best_loss)
+                                epoch, global_step, denoiser, optimizer, losses, best_loss, **ckpt)
                 msg += "  [last]"
 
             if epoch % ck_cfg["save_archive_freq"] == 0:
                 save_checkpoint(f"{out_dir}/checkpoint-ep{epoch:03d}.pt",
-                                epoch, global_step, denoiser, optimizer, losses, best_loss)
+                                epoch, global_step, denoiser, optimizer, losses, best_loss, **ckpt)
                 msg += f"  [archive ep{epoch:03d}]"
 
-            if avg < best_loss:
-                best_loss = avg
+            if is_best:
                 save_checkpoint(f"{out_dir}/checkpoint-best.pt",
-                                epoch, global_step, denoiser, optimizer, losses, best_loss)
+                                epoch, global_step, denoiser, optimizer, losses, best_loss, **ckpt)
                 msg += f"  [best ↓ {best_loss:.4f}]"
 
             print(msg)

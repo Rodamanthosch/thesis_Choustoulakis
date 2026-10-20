@@ -93,7 +93,14 @@ def _load_ema_from_state_dict(denoiser, state_dict, which):
             ema[i].copy_(tensor.to(device))
 
 
-def save_checkpoint(path, epoch, global_step, denoiser, optimizer, losses, best_loss):
+def save_checkpoint(path, epoch, global_step, denoiser, optimizer, losses, best_loss,
+                    rng_states=None, metrics=None):
+    """rng_states: one get_rng_states() per rank, taken at the epoch boundary,
+    so a resume continues the random stream (data order, flips, t, noise,
+    label drops) instead of restarting it. metrics: the MetricLogger history.
+
+    Written to path + '.tmp' and renamed into place: a job killed mid-write
+    leaves the previous checkpoint intact instead of a truncated file."""
     payload = {
         "epoch":        epoch,
         "global_step":  global_step,
@@ -104,7 +111,67 @@ def save_checkpoint(path, epoch, global_step, denoiser, optimizer, losses, best_
         "losses":       list(losses),
         "best_loss":    best_loss,
     }
-    torch.save(payload, path)
+    if rng_states is not None:
+        payload["rng"] = rng_states
+    if metrics is not None:
+        payload["metrics"] = list(metrics)
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+# ── RNG state (resume = uninterrupted run) ───────────────────────────────────
+#
+# Training draws everything random from the global generators: the shuffled
+# DataLoader order and its workers' seeds (torch CPU), the flips (workers,
+# seeded from that), and t / noise / label drops (torch on the training
+# device). The seed is set once at start-up, so without these states every
+# resumed job would replay the run's first epochs exactly.
+
+def get_rng_states():
+    import random
+    states = {
+        "torch":  torch.get_rng_state(),
+        "python": random.getstate(),
+        "numpy":  np.random.get_state(),
+    }
+    if torch.cuda.is_available():
+        states["cuda"] = torch.cuda.get_rng_state()      # current device
+    return states
+
+
+def set_rng_states(states):
+    import random
+    torch.set_rng_state(states["torch"].cpu())           # load_checkpoint may map to GPU
+    random.setstate(states["python"])
+    np.random.set_state(states["numpy"])
+    if "cuda" in states and torch.cuda.is_available():
+        torch.cuda.set_rng_state(states["cuda"].cpu())
+
+
+def gather_rng_states(world_size=1):
+    """Every rank's RNG state, as a list indexed by rank (DDP: a collective,
+    so EVERY rank must call it; only rank 0 saves the result)."""
+    state = get_rng_states()
+    if world_size == 1:
+        return [state]
+    import torch.distributed as dist
+    out = [None] * world_size
+    dist.all_gather_object(out, state)
+    return out
+
+
+def restore_rng_states(states, rank, world_size, seed, start_epoch):
+    """Put this rank back on the random stream it was on when the checkpoint
+    was written. Checkpoints without states (older ones), or saved with a
+    different number of ranks, get a fresh seed derived from (seed, rank,
+    epoch) instead: not the uninterrupted stream, but never a replay of the
+    stream the run started with. Returns True if the exact states were used."""
+    if states is not None and len(states) == world_size:
+        set_rng_states(states[rank])
+        return True
+    torch.manual_seed(seed + rank + 1_000_003 * start_epoch)
+    return False
 
 
 def _regroup_optimizer_state(saved, optimizer, saved_params):
@@ -423,8 +490,9 @@ class MetricLogger:
     def log(self, step: int, **kwargs):
         self.history.append({"step": step, **kwargs})
 
-    def save(self, path: str):
+    def save(self, path: str, quiet: bool = False):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w") as f:
             json.dump(self.history, f, indent=2)
-        print(f"Metrics saved → {path}")
+        if not quiet:
+            print(f"Metrics saved → {path}")

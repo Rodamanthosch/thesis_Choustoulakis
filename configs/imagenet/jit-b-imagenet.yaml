@@ -28,7 +28,7 @@ model:
   in_context_start: 0
 
 training:
-  epochs: 100                        # JiT paper runs longer for B; override via arg
+  epochs: 600                        # JiT paper / README (B/16 at 256). Constant LR: resumable at any epoch.
   batch_size: 1024                   # TOTAL -> 128/GPU on 8 (run_experiment divides by world_size)
   warmup_epochs: 5
   blr: 5.0e-5                        # lr = blr * total_batch/256 = 2e-4 (JiT ImageNet lr)
@@ -54,9 +54,10 @@ sampling:
   method: heun
   steps: 50
   amp: true                        # bf16 autocast sampling, as JiT engine_jit.py evaluate()
+  n_samples: 50000                 # FID-50K / IS-50K (50 per class), the JiT protocol; --n_samples overrides
 
 checkpoint:
-  save_last_freq: 5
-  save_archive_freq: 25
+  save_last_freq: 1                  # overwrite checkpoint-last.pt every epoch (resume point)
+  save_archive_freq: 50              # keep checkpoint-ep050.pt, -ep100.pt, ... -ep600.pt permanently
   resume_from: null
   output_dir: experiments/imagenet/jit-b-jit-baseline

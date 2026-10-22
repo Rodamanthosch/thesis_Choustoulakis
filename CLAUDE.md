@@ -102,6 +102,7 @@ ported.
 | `jit-s2-spatial-nogate-dstate16-shared` (no gate, d_state 16, shared kernels, lpu zero) | 29.89M |
 | `jit-s2-spatial-nogate-dstate16-perstate` (no gate, d_state 16, per-state kernels, lpu zero) | 31.76M |
 | `jit-s2-spatial-nogate-dstate4-shared` (no gate, d_state 4, shared kernels, lpu zero, no checkpointing: ≈8.3 GiB activations fits a T4) | 29.73M |
+| `jit-s2-spatial-nogate-dstate4-perstate` (no gate, d_state 4, per-state kernels, lpu zero, no checkpointing) | 30.10M |
 
 `tests/test_spatial_mamba_cpu.py` proves the mixer against a naive transcription
 of the paper's Eq. (2)–(3), `StateFusion` against the official module, and (check

@@ -354,7 +354,8 @@ bm_eval = load_build_model("scripts/evaluate.py")
 for name, sk, n_expect, N, ckpt in (
         ("jit-s2-spatial-nogate-dstate16-shared.yaml", "shared", 29_893_476, 16, True),
         ("jit-s2-spatial-nogate-dstate16-perstate.yaml", "per_state", 31_759_716, 16, True),
-        ("jit-s2-spatial-nogate-dstate4-shared.yaml", "shared", 29_727_588, 4, False)):
+        ("jit-s2-spatial-nogate-dstate4-shared.yaml", "shared", 29_727_588, 4, False),
+        ("jit-s2-spatial-nogate-dstate4-perstate.yaml", "per_state", 30_100_836, 4, False)):
     cfg = yaml.safe_load(open(os.path.join(REPO_ROOT, "configs", "tiny_imagenet", name),
                               encoding="utf-8"))
     torch.manual_seed(0)

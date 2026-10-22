@@ -3,7 +3,7 @@ scripts/check_sasf_cuda.py
 ==========================
 GPU check for the SASF experiments:
   - Spatial-Mamba, no gate, d_state 16 (sasf_state_kernels: shared | per_state)
-    and d_state 4 (shared, no checkpointing)
+    and d_state 4 (shared | per_state, no checkpointing)
   - JiT-S2-VMamba + SASF (model: vmamba_sasf, d_state 1)
 Run it once at the start of each run's first Kaggle session, in the same
 spirit as scripts/check_spatial_cuda.py.
@@ -109,6 +109,7 @@ CONFIGS = [
     "configs/tiny_imagenet/jit-s2-spatial-nogate-dstate16-shared.yaml",
     "configs/tiny_imagenet/jit-s2-spatial-nogate-dstate16-perstate.yaml",
     "configs/tiny_imagenet/jit-s2-spatial-nogate-dstate4-shared.yaml",
+    "configs/tiny_imagenet/jit-s2-spatial-nogate-dstate4-perstate.yaml",
     "configs/tiny_imagenet/jit-s2-vmamba-sasf.yaml",
 ]
 for path in CONFIGS:

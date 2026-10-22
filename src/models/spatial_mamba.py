@@ -26,11 +26,16 @@ exactly, and SASF fuses every state map with kernels shared by a channel's N
 maps or one set per state (sasf_state_kernels). Verified against a naive
 N-state transcription in tests/test_spatial_dstate16_cpu.py.
 
-Scope (v1): adaLN-Zero baseline only. None of JiT-VMamba's conditioning arms
-(in-context prefix, state-init, SSC, adaln_cond) are ported; src/models/vmamba.py
-is untouched. The block/model scaffold mirrors JiTVMamba line for line (proven
-by tests/test_spatial_mamba_cpu.py check J), so a JiT-Spatial vs JiT-VMamba run
-differs only in the mixer and the optional LPU.
+Conditioning: adaLN-Zero, plus (optionally) in-context class tokens placed
+INSIDE the scan (in_context_len / in_context_positions): token e is inserted
+just before grid cell (row_e, col_e) of the row-major scan instead of all at
+its head, so with SASF every image token can sit within a few scan steps of
+one (see JiTSpatialMamba). Off by default and then byte-for-byte the baseline
+(tests/test_spatial_incontext_cpu.py check A). State-init, SSC and adaln_cond
+are not ported; src/models/vmamba.py is untouched. The block/model scaffold
+mirrors JiTVMamba line for line (proven by tests/test_spatial_mamba_cpu.py
+check J), so a JiT-Spatial vs JiT-VMamba run differs only in the mixer and the
+optional LPU.
 """
 
 import math
@@ -43,7 +48,7 @@ from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from src.primitives import (
     RMSNorm, get_2d_sincos_pos_embed,
     TimestepEmbedder, LabelEmbedder,
-    BottleneckPatchEmbed, FinalLayer, modulate,
+    BottleneckPatchEmbed, FinalLayer, modulate, _dwconv_tokens,
 )
 from src.models.vmamba import FFN_CLASSES
 
@@ -120,6 +125,16 @@ class StructureAwareSSM(nn.Module):
       "per_state" -> one set of kernels per (channel, state) map
     Both fuse every map, so they cost the same compute. At N = 1 the two are
     the same module, and the forward is the original d_state = 1 code path.
+
+    In-context tokens (in_context_positions, sorted flat grid indices p_e):
+    x may then carry P = len(p) condition tokens in front of the H*W grid,
+    x: (B, P + H*W, D). Token e is scanned just before grid cell p_e (all p_e
+    = 0 is the DiM head prefix). As in SS2D, the tokens share in_proj, skip
+    the depthwise conv (no grid cell) and get their own dt/B/C from x_proj.
+    SASF fuses the GRID states only; a token's own output is C h + D u of its
+    unfused state. Output keeps the input layout [tokens, grid]. With P = 0
+    (no tokens, or a block before in_context_start) the forward is the
+    original code path.
     """
     def __init__(
         self,
@@ -130,6 +145,7 @@ class StructureAwareSSM(nn.Module):
         gate: bool = True,
         dilations=(1, 3, 5),
         state_kernels: str = "shared",
+        in_context_positions=(),
         dt_rank: int = None,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
@@ -149,6 +165,9 @@ class StructureAwareSSM(nn.Module):
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(d_model / 16)
         self.gate = bool(gate)
         self.state_kernels = state_kernels
+        self.in_context_positions = tuple(sorted(int(p) for p in in_context_positions))
+        assert all(p >= 0 for p in self.in_context_positions), self.in_context_positions
+        self._scan_order_cache = {}
 
         # ── 1. Input projection (u, and z when gated) ─────────────────
         self.in_proj = nn.Linear(
@@ -203,24 +222,57 @@ class StructureAwareSSM(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
 
+    def _scan_order(self, HW: int, device):
+        """Index maps between the layout [P tokens, HW grid] and the scan order.
+
+        order: scan position -> layout index (token e right before grid cell
+        p_e); inv: layout index -> scan position. seq = cat[..., order] and
+        cat = seq[..., inv].
+        """
+        key = (HW, str(device))
+        if key not in self._scan_order_cache:
+            pos, P = self.in_context_positions, len(self.in_context_positions)
+            assert not pos or pos[-1] < HW, (
+                "in-context position %d is outside the %d-cell grid" % (pos[-1], HW))
+            order, e = [], 0
+            for g in range(HW):
+                while e < P and pos[e] == g:
+                    order.append(e)
+                    e += 1
+                order.append(P + g)
+            order = torch.tensor(order, device=device)
+            self._scan_order_cache[key] = (order, torch.argsort(order))
+        return self._scan_order_cache[key]
+
     def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
         B, L, _ = x.shape
         d_inner, d_state = self.d_inner, self.d_state
-        assert L == H * W, (
-            "StructureAwareSSM got %d tokens for a %dx%d grid; in-context "
-            "prefix tokens are not supported by the spatial mixer" % (L, H, W)
+        HW = H * W
+        P = L - HW                     # in-context tokens in front of the grid
+        assert P in (0, len(self.in_context_positions)), (
+            "StructureAwareSSM got %d tokens for a %dx%d grid; expected the grid "
+            "plus 0 or %d in-context tokens"
+            % (L, H, W, len(self.in_context_positions))
         )
 
-        # ── 1. in_proj ───────────────────────────────────────────────
+        # ── 1. in_proj (in-context tokens share it, as in DiM / SS2D) ─
         xz = self.in_proj(x)
         if self.gate:
             u, z = xz.chunk(2, dim=-1)                          # (B, L, d_inner) each
         else:
             u, z = xz, None
+        if P:
+            u_extra = u[:, :P].transpose(1, 2)                  # (B, d_inner, P): no grid cell,
+            u = u[:, P:]                                        # so no conv (as SS2D)
 
         # ── 2. depthwise conv + SiLU on the grid, back to row-major ──
         u = u.view(B, H, W, d_inner).permute(0, 3, 1, 2).contiguous()
-        u = self.act(self.conv2d(u)).reshape(B, d_inner, L)     # (B, d_inner, L)
+        u = self.act(self.conv2d(u)).reshape(B, d_inner, HW)    # (B, d_inner, HW)
+
+        # ── 2b. in-context tokens into the scan, before their grid cells ─
+        if P:
+            order, inv = self._scan_order(HW, u.device)
+            u = torch.cat([u_extra.to(u.dtype), u], dim=-1)[..., order]   # scan order
 
         # ── 3. data-dependent dt, B, C ───────────────────────────────
         x_dbl = torch.einsum("bdl,od->bol", u, self.x_proj_weight)
@@ -240,9 +292,14 @@ class StructureAwareSSM(nn.Module):
                 delta_softplus=True,
                 return_last_state=False,
             )                                                   # (B, d_inner, L) = x_t
+            if P:   # back to [tokens, grid]; the tokens' states are not fused
+                states, u, C_ssm = (s[..., inv] for s in (states, u, C_ssm))
+                s_extra, states = states[..., :P], states[..., P:].contiguous()
 
             # ── 5. SASF over the 2-D grid of states ──────────────────
-            h = self.state_fusion(states.view(B, d_inner, H, W)).reshape(B, d_inner, L)
+            h = self.state_fusion(states.view(B, d_inner, H, W)).reshape(B, d_inner, HW)
+            if P:
+                h = torch.cat([s_extra, h], dim=-1)             # (B, d_inner, P + HW)
 
             # ── 6. observation y = C h + D u (official ssm()) ────────
             y = h * C_ssm + u * self.Ds.view(-1, 1)             # (B, d_inner, L)
@@ -263,13 +320,19 @@ class StructureAwareSSM(nn.Module):
                 delta_softplus=True,
                 return_last_state=False,
             )                                                   # (B, N*d_inner, L)
+            if P:   # back to [tokens, grid]; the tokens' states are not fused
+                states, u, C_ssm = (s[..., inv] for s in (states, u, C_ssm))
+                s_extra = states[..., :P].reshape(B, N, d_inner, P)
+                states = states[..., P:].contiguous()
 
             # ── 5'. SASF on every state map ──────────────────────────
             if self.state_kernels == "per_state":
                 h = self.state_fusion(states.view(B, N * d_inner, H, W))
             else:   # "shared": the channel's kernels on each of its N maps
                 h = self.state_fusion(states.reshape(B * N, d_inner, H, W))
-            h = h.reshape(B, N, d_inner, L)
+            h = h.reshape(B, N, d_inner, HW)
+            if P:
+                h = torch.cat([s_extra, h], dim=-1)             # (B, N, d_inner, P + HW)
 
             # ── 6'. observation y[c] = sum_n C[n] h[c, n] + D[c] u[c] ─
             y = (h * C_ssm.unsqueeze(2)).sum(dim=1) + u * self.Ds.view(-1, 1)
@@ -293,11 +356,13 @@ class JiTSpatialBlock(nn.Module):
       "zero"  -> LPU with zero-init weight and bias: every block is still the
                  identity at init (adaLN-Zero discipline)
       "paper" -> LPU with PyTorch's default conv init (official code)
+    In-context tokens (in front of the grid) have no grid cell: the LPU, like
+    the conv FFNs, gives them only the kernel's centre tap.
     """
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=1, d_conv=3, expand=1, gate=True,
                  sasf_dilations=(1, 3, 5), lpu="none", sasf_state_kernels="shared",
-                 grad_checkpoint=False,
+                 grad_checkpoint=False, in_context_positions=(),
                  attn_drop=0.0, proj_drop=0.0, ffn="swiglu"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
@@ -305,7 +370,7 @@ class JiTSpatialBlock(nn.Module):
         self.mixer = StructureAwareSSM(
             d_model=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand,
             gate=gate, dilations=sasf_dilations, state_kernels=sasf_state_kernels,
-            proj_drop=proj_drop,
+            in_context_positions=in_context_positions, proj_drop=proj_drop,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -329,10 +394,9 @@ class JiTSpatialBlock(nn.Module):
 
     @staticmethod
     def _grid_conv(conv, x, H, W):
-        """Depthwise conv over the token grid of x: (B, H*W, D) -> same shape."""
-        B, L, D = x.shape
-        g = x.transpose(1, 2).reshape(B, D, H, W)
-        return conv(g).flatten(2).transpose(1, 2)
+        """Depthwise conv over the token grid of x: (B, P + H*W, D) -> same
+        shape; the P leading in-context tokens see only the centre tap."""
+        return _dwconv_tokens(conv, x, H, W)
 
     def forward(self, x, c, H, W):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
@@ -358,10 +422,21 @@ class JiTSpatialBlock(nn.Module):
 class JiTSpatialMamba(nn.Module):
     """JiT with the Structure-aware SSM (Spatial-Mamba) mixer.
 
-    Class conditioning via adaLN-Zero only (no in-context tokens, no SSM-level
-    conditioning). Mirrors JiTVMamba's baseline scaffold exactly; the knobs are
-    the mixer's (d_state, expand, gate, sasf_dilations, sasf_state_kernels), the
-    LPU, and the FFN variant.
+    Class conditioning via adaLN-Zero, optionally plus in-context class tokens
+    (no SSM-level conditioning). Mirrors JiTVMamba's baseline scaffold exactly;
+    the knobs are the mixer's (d_state, expand, gate, sasf_dilations,
+    sasf_state_kernels), the LPU, the FFN variant and the in-context tokens.
+
+    In-context class tokens (in_context_len > 0), JiTVMamba's persist & update
+    scheme: in_context_len tokens [y_emb + slot_e] are prepended ONCE at block
+    in_context_start, updated by every later block and stripped after the
+    last. in_context_positions places them in the ONE row-major scan: token e
+    is scanned just before grid cell (row_e, col_e). None puts them all before
+    cell (0, 0), i.e. the DiM head prefix. Spreading them works because SASF
+    reads states up to max(dilations) rows/columns away in every direction:
+    on the 8x8 grid with dilations (1, 2, 3), cells (0,3), (3,3), (7,3) put
+    every image token within 2 scan steps of a class token (one prefix
+    token: 37), +3 tokens of scan length.
     """
     def __init__(
         self,
@@ -395,6 +470,14 @@ class JiTSpatialMamba(nn.Module):
         grad_checkpoint: bool = False,
         # FFN variant (same choices as JiTVMamba)
         ffn: str = "swiglu",
+        # In-context class tokens (off by default; see the class docstring)
+        #   in_context_len=0 -> adaLN-Zero only, byte-for-byte the baseline
+        in_context_len: int = 0,
+        in_context_start: int = 0,
+        in_context_content: str = "class",        # only "class" is ported
+        #   [[row, col], ...], one per token: scanned just before that grid
+        #   cell; None -> all before (0, 0) (DiM head prefix)
+        in_context_positions=None,
     ):
         super().__init__()
         assert ffn in FFN_CLASSES, (
@@ -424,6 +507,46 @@ class JiTSpatialMamba(nn.Module):
         # Spatial grid size (used by the mixer, the LPU and the conv FFNs)
         self.grid_size = input_size // patch_size
 
+        # In-context class tokens: validate and resolve their scan positions.
+        self.in_context_len = in_context_len
+        self.in_context_start = in_context_start
+        self.in_context_content = in_context_content
+        cells = ()
+        if in_context_len > 0:
+            assert in_context_content == "class", (
+                "Unknown in_context_content=%r: only 'class' is ported to "
+                "spatial_mamba" % (in_context_content,)
+            )
+            assert 0 <= in_context_start < depth, (
+                "in_context_start=%d must index a block (depth %d)"
+                % (in_context_start, depth)
+            )
+            if in_context_positions is None:
+                cells = ((0, 0),) * in_context_len
+            else:
+                cells = tuple(tuple(int(v) for v in p) for p in in_context_positions)
+                assert len(cells) == in_context_len and all(len(p) == 2 for p in cells), (
+                    "in_context_positions needs one [row, col] per token "
+                    "(in_context_len=%d); got %r" % (in_context_len, in_context_positions)
+                )
+                assert all(0 <= r < self.grid_size and 0 <= c < self.grid_size
+                           for r, c in cells), (
+                    "in_context_positions must lie on the %dx%d grid; got %r"
+                    % (self.grid_size, self.grid_size, in_context_positions)
+                )
+                cells = tuple(sorted(cells))      # token e = e-th in scan order
+            # Learnable positional slot per token (DiM additional_embed), as JiTVMamba.
+            self.incontext_pos_embed = nn.Parameter(
+                torch.zeros(1, in_context_len, hidden_size)
+            )
+            nn.init.normal_(self.incontext_pos_embed, std=0.02)   # LTH14/JiT init
+        else:
+            assert not in_context_positions, (
+                "in_context_positions places in-context tokens; set in_context_len > 0"
+            )
+        self.in_context_positions = cells
+        flat_positions = tuple(r * self.grid_size + c for r, c in cells)
+
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
         self.x_embedder = BottleneckPatchEmbed(
@@ -443,6 +566,7 @@ class JiTSpatialMamba(nn.Module):
                 d_state=d_state, d_conv=d_conv, expand=expand, gate=gate,
                 sasf_dilations=sasf_dilations, lpu=lpu,
                 sasf_state_kernels=sasf_state_kernels, grad_checkpoint=grad_checkpoint,
+                in_context_positions=flat_positions,
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 ffn=ffn,
@@ -525,8 +649,17 @@ class JiTSpatialMamba(nn.Module):
         x = x + self.pos_embed
 
         H = W = self.grid_size
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
+            # Prepend the class tokens ONCE, then let them persist & update
+            # (each mixer scans them before their grid cells; see the docstring).
+            if self.in_context_len > 0 and i == self.in_context_start:
+                ctx = torch.stack([y_emb] * self.in_context_len, dim=1)
+                x = torch.cat([ctx + self.incontext_pos_embed, x], dim=1)
             x = block(x, c, H, W)
+
+        # Strip the class tokens once, after the final block.
+        if self.in_context_len > 0:
+            x = x[:, self.in_context_len:, :]
 
         x = self.final_layer(x, c)
         return self.unpatchify(x)

@@ -177,6 +177,10 @@ def build_model(cfg):
             sasf_state_kernels=m.get("sasf_state_kernels", "shared"),
             grad_checkpoint=m.get("grad_checkpoint", False),
             ffn=m.get("ffn", "swiglu"),
+            in_context_len=m.get("in_context_len", 0),
+            in_context_start=m.get("in_context_start", 0),
+            in_context_content=m.get("in_context_content", "class"),
+            in_context_positions=m.get("in_context_positions", None),
         )
     elif arch == "vmamba2":
         from src.models.vmamba2 import JiTVMamba2

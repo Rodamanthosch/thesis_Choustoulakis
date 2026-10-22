@@ -80,9 +80,21 @@ CUDA op is needed. `d_state > 1` (an extension; the paper defines N = 1) runs
 the scan over `N·d_inner` single-state channels (u, Δ repeated; `A[c, n]`;
 B-group n carries `B_t[n]`), which is the N-state Mamba-1 recurrence exactly;
 SASF fuses all N·d_inner state maps and `y[c] = Σ_n C[n]·h[c, n] + D[c]·u[c]`.
-The d_state 1 forward is the original code path, unchanged. Baseline
-conditioning only (adaLN-Zero); the in-context / state-init / SSC arms are not
-ported.
+The d_state 1 forward is the original code path, unchanged. Conditioning:
+adaLN-Zero, plus optional **in-context class tokens placed inside the scan**
+(below); the state-init / SSC arms and `adaln_cond` are not ported.
+
+In-context class tokens follow the VMamba arm's persist & update scheme
+(`y_emb + slot`, prepended once at `in_context_start`, stripped after the last
+block), but `in_context_positions` puts token e **just before grid cell
+(row, col)** of the one row-major scan instead of all at its head (`null` =
+all before (0, 0), the DiM prefix). Tokens share `in_proj`, skip the mixer's
+DWConv, get only the centre tap of the LPU / conv FFNs, and are **not fused**
+by SASF (grid states only); their output is `C·h + D·u` of their own state.
+Because SASF reads states up to max(dilation) rows/columns away in every
+direction, tokens mid-row reach the cells on both sides: on 8×8 with
+`[1, 2, 3]`, cells (0,3), (3,3), (7,3) put every image token within 2 scan
+steps (mean 1.19) of a class token, vs 37 / 12.25 for one head token.
 
 | key | values | meaning |
 |---|---|---|
@@ -92,6 +104,9 @@ ported.
 | `d_state` | default 1 | >1: N states per channel (see above) |
 | `sasf_state_kernels` | `shared` (default) \| `per_state` | d_state > 1 only: one kernel set per channel for all its N maps \| one per (channel, state) map (+27·d_inner·(N−1) params per block); same compute |
 | `grad_checkpoint` | `false` (default) \| `true` | recompute each mixer in the backward pass (same maths, bit-identical); on in the d_state-16 configs: ≈24 → 2.5 GiB activations at batch 128 |
+| `in_context_len` | default 0 | number of class tokens; 0 = adaLN-Zero only, byte-for-byte the baseline |
+| `in_context_start`, `in_context_content` | default 0, `class` | block the tokens enter at; only `class` is ported |
+| `in_context_positions` | `null` (default) \| `[[row, col], ...]` | one cell per token, scanned just before it; `null` = head prefix |
 | `expand`, `ffn` | as `vmamba` | |
 
 | Tiny-IN config | params |
@@ -103,6 +118,7 @@ ported.
 | `jit-s2-spatial-nogate-dstate16-perstate` (no gate, d_state 16, per-state kernels, lpu zero) | 31.76M |
 | `jit-s2-spatial-nogate-dstate4-shared` (no gate, d_state 4, shared kernels, lpu zero, no checkpointing: ≈8.3 GiB activations fits a T4) | 29.73M |
 | `jit-s2-spatial-nogate-dstate4-perstate` (no gate, d_state 4, per-state kernels, lpu zero, no checkpointing) | 30.10M |
+| `jit-s2-spatial-nogate-incontext-class3` (no gate, lpu zero, 3 class tokens before (0,3) (3,3) (7,3) from block 4) | 29,687,268 |
 
 `tests/test_spatial_mamba_cpu.py` proves the mixer against a naive transcription
 of the paper's Eq. (2)–(3), `StateFusion` against the official module, and (check
@@ -111,6 +127,11 @@ J) that the copied block/model scaffold is bit-identical to `JiTVMamba`'s;
 proves d_state 1 is bit-identical to HEAD, the N·d_inner-channel scan equals the
 N-state recurrence, the N = 16 mixer equals a naive transcription for both
 `sasf_state_kernels`, and `shared` == `per_state` with tied kernels.
+`tests/test_spatial_incontext_cpu.py` proves tokens-off is bit-identical to HEAD,
+the mixer with tokens equals a naive float64 transcription, the placement is
+causal, and recomputes the distance figures from the module's scan order;
+`scripts/check_spatial_incontext_cuda.py` is the GPU check (exactness, bf16
+fwd+bwd, it/s and peak memory vs the no-gate run).
 
 ## JiT-S2-VMamba + SASF (`model: vmamba_sasf`)
 

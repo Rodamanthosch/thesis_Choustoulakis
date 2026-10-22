@@ -32,7 +32,7 @@ Checks:
   I. grad_checkpoint (recompute each mixer in backward; on in the d_state-16
      configs, which do not fit a 15 GB T4 at batch 128 otherwise) changes
      nothing: same parameters, BIT-IDENTICAL output and gradients.
-  H. wiring: the two d_state-16 configs build IDENTICAL models through
+  H. wiring: the d_state-16 and d_state-4 configs build IDENTICAL models through
      scripts/run_experiment.py::build_model and scripts/evaluate.py::build_model
      (needs pyyaml; skipped otherwise).
 
@@ -351,8 +351,10 @@ def load_build_model(rel):
 
 bm_train = load_build_model("scripts/run_experiment.py")
 bm_eval = load_build_model("scripts/evaluate.py")
-for name, sk, n_expect in (("jit-s2-spatial-nogate-dstate16-shared.yaml", "shared", 29_893_476),
-                           ("jit-s2-spatial-nogate-dstate16-perstate.yaml", "per_state", 31_759_716)):
+for name, sk, n_expect, N, ckpt in (
+        ("jit-s2-spatial-nogate-dstate16-shared.yaml", "shared", 29_893_476, 16, True),
+        ("jit-s2-spatial-nogate-dstate16-perstate.yaml", "per_state", 31_759_716, 16, True),
+        ("jit-s2-spatial-nogate-dstate4-shared.yaml", "shared", 29_727_588, 4, False)):
     cfg = yaml.safe_load(open(os.path.join(REPO_ROOT, "configs", "tiny_imagenet", name),
                               encoding="utf-8"))
     torch.manual_seed(0)
@@ -361,9 +363,9 @@ for name, sk, n_expect in (("jit-s2-spatial-nogate-dstate16-shared.yaml", "share
     me = bm_eval(cfg)
     st, se = mt.state_dict(), me.state_dict()
     assert set(st) == set(se) and all(torch.equal(st[k], se[k]) for k in st), name
-    assert (mt.d_state, mt.sasf_state_kernels, mt.gate, mt.lpu) == (16, sk, False, "zero"), name
+    assert (mt.d_state, mt.sasf_state_kernels, mt.gate, mt.lpu) == (N, sk, False, "zero"), name
     assert mt.sasf_dilations == (1, 2, 3) and n_params(mt) == n_expect, (name, n_params(mt))
-    assert mt.grad_checkpoint and all(b.grad_checkpoint for b in mt.blocks), name
+    assert mt.grad_checkpoint == ckpt and all(b.grad_checkpoint == ckpt for b in mt.blocks), name
     print(f"H  {name}: train == eval build_model, {n_params(mt) / 1e6:.2f}M params")
 
 print("ALL CHECKS PASSED")

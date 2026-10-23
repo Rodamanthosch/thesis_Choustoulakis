@@ -29,7 +29,8 @@ model:
 
 training:
   epochs: 600                        # JiT paper / README (B/16 at 256). Constant LR: resumable at any epoch.
-  batch_size: 1024                   # TOTAL -> 128/GPU on 8 (run_experiment divides by world_size)
+  batch_size: 1024                   # EFFECTIVE total: micro-batch = 1024 / (world_size * accum_iter)
+  accum_iter: 4                      # 1 GPU: 4 x 256 = 1024 (same updates as JiT's 8 GPUs x 128)
   warmup_epochs: 5
   blr: 5.0e-5                        # lr = blr * total_batch/256 = 2e-4 (JiT ImageNet lr)
   optimizer: adamw

@@ -46,9 +46,19 @@ PATCHES:
              is written every epoch and resumed, a missing resume_from warns
              loudly, and training.num_workers (default 12) sets the loader
              workers.
+  GRAD-ACCUM — training.accum_iter (default 1 = the loop above, unchanged):
+             training.batch_size stays the EFFECTIVE global batch (so the LR
+             rule and the EMA keep their meaning); each GPU loads micro-batches
+             of batch_size // (world_size * accum_iter), the loss is divided by
+             accum_iter, and the optimizer / LR / EMA / global_step advance once
+             per accum_iter micro-batches (DDP all-reduces only on the last,
+             via no_sync). The net has no BatchNorm and the loss is a batch
+             mean, so with equal micro-batches (drop_last) the update equals
+             the full-batch one up to float rounding. A trailing remainder of
+             < accum_iter micro-batches per epoch is skipped.
 """
 
-import argparse, math, os, sys, yaml
+import argparse, contextlib, math, os, sys, yaml
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -308,12 +318,21 @@ def main():
     )
 
     # ── Data ───────────────────────────────────────────────────────────────────
+    accum_iter = int(t_cfg.get("accum_iter", 1))
+    assert accum_iter >= 1 and t_cfg["batch_size"] % (world_size * accum_iter) == 0, (
+        f"training.batch_size {t_cfg['batch_size']} must divide into "
+        f"{world_size} GPU(s) x accum_iter {accum_iter} equal micro-batches")
+    micro_bs = t_cfg["batch_size"] // (world_size * accum_iter)
+    if main_proc and accum_iter > 1:
+        print(f"Grad accumulation: {accum_iter} x {micro_bs} per GPU x {world_size} GPU(s) "
+              f"= effective batch {t_cfg['batch_size']}")
+
     train_ds = build_dataset(cfg)
     sampler  = DistributedSampler(train_ds, num_replicas=world_size,
                                    rank=rank, shuffle=True) if world_size > 1 else None
     loader   = DataLoader(
         train_ds,
-        batch_size  = t_cfg["batch_size"] // world_size,  # per-GPU batch size
+        batch_size  = micro_bs,  # per-GPU micro-batch (= batch_size // world_size at accum_iter 1)
         shuffle     = (sampler is None),
         sampler     = sampler,
         # ─── BUG #15 FIX: num_workers=12 matches LTH14/JiT main_jit.py ───
@@ -324,8 +343,11 @@ def main():
         drop_last   = True,
     )
 
-    steps_per_epoch = len(loader)
-    warmup_steps    = t_cfg["warmup_epochs"] * steps_per_epoch
+    # Optimizer steps (not micro-batches): warmup, global_step and the EMA
+    # all count these.
+    steps_per_epoch = len(loader) // accum_iter
+    assert steps_per_epoch > 0, "fewer micro-batches per epoch than accum_iter"
+    warmup_steps   = t_cfg["warmup_epochs"] * steps_per_epoch
     lr_at_step      = make_lr_fn(peak_lr, warmup_steps)
     use_amp         = "cuda" in device and t_cfg.get("amp", True)
 
@@ -365,30 +387,44 @@ def main():
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{t_cfg['epochs']}",
                     leave=False, disable=not main_proc)
 
-        for images, labels in pbar:
+        n_micro = steps_per_epoch * accum_iter  # drops the < accum_iter remainder
+        for it, (images, labels) in enumerate(pbar):
+            if it == n_micro:
+                break
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            first_micro = it % accum_iter == 0
+            last_micro  = it % accum_iter == accum_iter - 1
 
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr_at_step(global_step)
+            if first_micro:
+                for pg in optimizer.param_groups:
+                    pg["lr"] = lr_at_step(global_step)
+                optimizer.zero_grad(set_to_none=True)
 
-            optimizer.zero_grad(set_to_none=True)
-            # ─── BUG #4 FIX: bf16 autocast (no GradScaler — bf16 doesn't need it) ──
-            # Matches LTH14/JiT engine_jit.py line 33-35 exactly.
-            if use_amp:
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            # DDP: skip the gradient all-reduce on all but the last micro-batch.
+            sync = contextlib.nullcontext() if last_micro or world_size == 1 \
+                else model.no_sync()
+            with sync:
+                # ─── BUG #4 FIX: bf16 autocast (no GradScaler — bf16 doesn't need it) ──
+                # Matches LTH14/JiT engine_jit.py line 33-35 exactly.
+                if use_amp:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        loss = model(images, labels)
+                else:
                     loss = model(images, labels)
-            else:
-                loss = model(images, labels)
 
-            # LTH14/JiT engine_jit.py: stop on a non-finite loss BEFORE the
-            # update, so no NaN step is taken and no broken checkpoint saved.
-            loss_value = loss.item()
-            if not math.isfinite(loss_value):
-                print("Loss is {}, stopping training".format(loss_value))
-                sys.exit(1)
+                # LTH14/JiT engine_jit.py: stop on a non-finite loss BEFORE the
+                # update, so no NaN step is taken and no broken checkpoint saved.
+                loss_value = loss.item()
+                if not math.isfinite(loss_value):
+                    print("Loss is {}, stopping training".format(loss_value))
+                    sys.exit(1)
 
-            loss.backward()
+                (loss / accum_iter if accum_iter > 1 else loss).backward()
+            epoch_loss += loss_value
+
+            if not last_micro:
+                continue
             optimizer.step()
             # ──────────────────────────────────────────────────────────────────────
 
@@ -397,7 +433,6 @@ def main():
                 denoiser.update_ema()
 
             global_step += 1
-            epoch_loss  += loss_value
             if main_proc:
                 pbar.set_postfix(loss=f"{loss_value:.4f}",
                                  lr=f"{optimizer.param_groups[0]['lr']:.2e}")
@@ -410,7 +445,7 @@ def main():
 
         # ── Logging + checkpointing (main process only) ──────────────────────
         if main_proc:
-            avg = epoch_loss / len(loader)
+            avg = epoch_loss / n_micro
             losses.append(avg)
             # best_loss is updated BEFORE any save, so checkpoint-last carries
             # it: a resumed run must not overwrite checkpoint-best with a worse

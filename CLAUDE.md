@@ -114,6 +114,7 @@ steps (mean 1.19) of a class token, vs 37 / 12.25 for one head token.
 | `jit-s2-vmamba-dstate1` (SS2D, `d_state: 1`, config only) | 30.20M |
 | `jit-s2-spatial-gate` (expand 1, gate, lpu zero) | 31.46M |
 | `jit-s2-spatial-nogate` (expand 1, no gate, lpu zero) | 29.69M |
+| `jit-s2-spatial-nogate-nolpu` (as above, `lpu: none`: LPU ablation vs `jit-s2-vmamba-sasf`) | 29,593,956 |
 | `jit-s2-spatial-nogate-dstate16-shared` (no gate, d_state 16, shared kernels, lpu zero) | 29.89M |
 | `jit-s2-spatial-nogate-dstate16-perstate` (no gate, d_state 16, per-state kernels, lpu zero) | 31.76M |
 | `jit-s2-spatial-nogate-dstate4-shared` (no gate, d_state 4, shared kernels, lpu zero, no checkpointing: ≈8.3 GiB activations fits a T4) | 29.73M |

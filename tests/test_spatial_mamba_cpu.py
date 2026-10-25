@@ -30,7 +30,7 @@ Checks:
   H. guards: unknown sasf_state_kernels / lpu / ffn, and a token count != H*W
      fail. (d_state > 1 is supported since the d_state-16 extension; it is
      tested in tests/test_spatial_dstate16_cpu.py.)
-  I. wiring: the three new Tiny-ImageNet configs build IDENTICAL models through
+  I. wiring: the Tiny-ImageNet configs (+ the no-LPU ablation) build IDENTICAL models through
      scripts/run_experiment.py::build_model and scripts/evaluate.py::build_model,
      with the expected param counts (needs pyyaml; skipped otherwise).
   J. drift guard: with each block's mixer swapped for SS2D(d_state=1), the
@@ -451,6 +451,7 @@ EXPECT = {
     "jit-s2-vmamba-dstate1.yaml":  (JiTVMamba, 30_202_176),
     "jit-s2-spatial-gate.yaml":    (JiTSpatialMamba, 31_455_588),
     "jit-s2-spatial-nogate.yaml":  (JiTSpatialMamba, 29_686_116),
+    "jit-s2-spatial-nogate-nolpu.yaml": (JiTSpatialMamba, 29_593_956),
 }
 for name, (cls, n_expect) in EXPECT.items():
     cfg_path = os.path.join(REPO_ROOT, "configs", "tiny_imagenet", name)
@@ -464,7 +465,9 @@ for name, (cls, n_expect) in EXPECT.items():
     assert set(st) == set(se) and all(torch.equal(st[k], se[k]) for k in st), name
     assert n_params(mt) == n_expect, (name, n_params(mt))
     if cls is JiTSpatialMamba:
-        assert mt.sasf_dilations == (1, 2, 3) and mt.lpu == "zero", name
+        assert mt.sasf_dilations == (1, 2, 3), name
+        assert mt.lpu == ("none" if "nolpu" in name else "zero"), name
+        assert not any(hasattr(b, "cpe1") for b in mt.blocks) or mt.lpu != "none", name
         assert mt.gate == (name == "jit-s2-spatial-gate.yaml"), name
     print(f"I  {name}: train == eval build_model, {cls.__name__}, "
           f"{n_params(mt) / 1e6:.2f}M params")

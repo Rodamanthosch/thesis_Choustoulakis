@@ -25,7 +25,7 @@ from src.primitives import (
     RMSNorm, get_2d_sincos_pos_embed,
     TimestepEmbedder, LabelEmbedder,
     BottleneckPatchEmbed, SwiGLUFFN, ConvGLUFFN, GLUMBConvFFN,
-    FinalLayer, modulate,
+    FinalLayer, modulate, NORMS, convert_rmsnorm_to_derf,
 )
 
 # FFN variants selectable by `ffn` (orthogonal to the conditioning arms).
@@ -623,12 +623,23 @@ class JiTVMamba(nn.Module):
         #   Both keep SwiGLU's param-matched width int(mlp_ratio*D*2/3); the
         #   in-context prefix sees only the conv's centre tap (see primitives).
         ffn: str = "swiglu",
+        # ── Norm layer (orthogonal to every arm; not in n_arms) ──
+        #   "rmsnorm" → the baseline, byte-for-byte
+        #   "derf"    → Derf (Chen et al., CVPR 2026) in place of norm1, norm2
+        #               and norm_final; SS2D's post-scan LayerNorm stays
+        #   derf_alpha_init: the paper's 0.5 (1.0 for its DiT-XL)
+        norm: str = "rmsnorm",
+        derf_alpha_init: float = 0.5,
     ):
         super().__init__()
         assert ffn in FFN_CLASSES, (
             "Unknown ffn=%r (use %s)" % (ffn, " | ".join(FFN_CLASSES))
         )
+        assert norm in NORMS, (
+            "Unknown norm=%r (use %s)" % (norm, " | ".join(NORMS))
+        )
         self.ffn = ffn
+        self.norm_type = norm
         if isinstance(adaln_cond, bool):          # install_noadaln.sh configs
             adaln_cond = "full" if adaln_cond else "none"
         assert adaln_cond in ("full", "mlp", "none"), (
@@ -749,6 +760,8 @@ class JiTVMamba(nn.Module):
             FinalLayerStatic if adaln_cond == "none" else FinalLayer
         )(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
+        if norm == "derf":
+            convert_rmsnorm_to_derf(self, derf_alpha_init)
 
     def initialize_weights(self):
         def _basic_init(m):

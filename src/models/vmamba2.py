@@ -42,7 +42,7 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from src.primitives import (
     RMSNorm, get_2d_sincos_pos_embed,
     TimestepEmbedder, LabelEmbedder,
-    BottleneckPatchEmbed, FinalLayer, modulate,
+    BottleneckPatchEmbed, FinalLayer, modulate, NORMS, convert_rmsnorm_to_derf,
 )
 from src.models.vmamba import FFN_CLASSES, cross_scan, cross_merge
 
@@ -234,11 +234,19 @@ class JiTVMamba2(nn.Module):
         force_fp32: bool = False,
         # FFN variant (same choices as JiTVMamba)
         ffn: str = "swiglu",
+        # Norm layer (same choices as JiTVMamba): "rmsnorm" | "derf" in
+        # place of norm1, norm2, norm_final (the mixer's out_norm stays)
+        norm: str = "rmsnorm",
+        derf_alpha_init: float = 0.5,
     ):
         super().__init__()
         assert ffn in FFN_CLASSES, (
             "Unknown ffn=%r (use %s)" % (ffn, " | ".join(FFN_CLASSES))
         )
+        assert norm in NORMS, (
+            "Unknown norm=%r (use %s)" % (norm, " | ".join(NORMS))
+        )
+        self.norm_type = norm
         self.ffn = ffn
         self.force_fp32 = force_fp32
         self.in_channels  = in_channels
@@ -278,6 +286,8 @@ class JiTVMamba2(nn.Module):
 
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
+        if norm == "derf":
+            convert_rmsnorm_to_derf(self, derf_alpha_init)
 
     def initialize_weights(self):
         def _basic_init(m):

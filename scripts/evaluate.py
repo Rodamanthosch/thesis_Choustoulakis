@@ -111,6 +111,8 @@ def build_model(cfg):
             adaln_cond=m.get("adaln_cond", "full"),
             ssc_z_mlp=m.get("ssc_z_mlp", False),
             ffn=m.get("ffn", "swiglu"),
+            norm=m.get("norm", "rmsnorm"),
+            derf_alpha_init=m.get("derf_alpha_init", 0.5),
         )
     elif arch == "spatial_mamba":
         from src.models.spatial_mamba import JiTSpatialMamba
@@ -127,6 +129,8 @@ def build_model(cfg):
             sasf_state_kernels=m.get("sasf_state_kernels", "shared"),
             grad_checkpoint=m.get("grad_checkpoint", False),
             ffn=m.get("ffn", "swiglu"),
+            norm=m.get("norm", "rmsnorm"),
+            derf_alpha_init=m.get("derf_alpha_init", 0.5),
             in_context_len=m.get("in_context_len", 0),
             in_context_start=m.get("in_context_start", 0),
             in_context_content=m.get("in_context_content", "class"),
@@ -146,6 +150,8 @@ def build_model(cfg):
             chunk_size=m.get("chunk_size", 64),
             force_fp32=m.get("force_fp32", False),
             ffn=m.get("ffn", "swiglu"),
+            norm=m.get("norm", "rmsnorm"),
+            derf_alpha_init=m.get("derf_alpha_init", 0.5),
         )
     elif arch == "vmamba_sasf":
         from src.models.vmamba_sasf import JiTVMambaSASF
@@ -159,6 +165,8 @@ def build_model(cfg):
             expand=m.get("expand", 1), K=m.get("K", 4),
             sasf_dilations=tuple(m.get("sasf_dilations", (1, 3, 5))),
             ffn=m.get("ffn", "swiglu"),
+            norm=m.get("norm", "rmsnorm"),
+            derf_alpha_init=m.get("derf_alpha_init", 0.5),
         )
     else:
         raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba | spatial_mamba | vmamba2 | vmamba_sasf")

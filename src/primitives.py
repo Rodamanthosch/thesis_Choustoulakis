@@ -44,6 +44,48 @@ class RMSNorm(nn.Module):
         return (self.weight * norm).type_as(x)
 
 
+# ── Derf (Chen et al., "Stronger Normalization-Free Transformers", CVPR 2026) ──
+# Dynamic erf, a point-wise stand-in for a norm layer (paper Eq. 10):
+#   Derf(x) = weight * erf(alpha * x + shift) + bias
+# alpha, shift: learnable scalars (init 0.5, 0); weight, bias: per channel
+# (init 1, 0) — the official Dynamic_erf. Computed in fp32 and cast back, as
+# RMSNorm above does (the paper's DiT runs are fp32 throughout).
+
+NORMS = ("rmsnorm", "derf")
+
+
+class Derf(nn.Module):
+    def __init__(self, dim, alpha_init=0.5, shift_init=0.0):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init)
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.shift = nn.Parameter(torch.ones(1) * shift_init)
+
+    def forward(self, x):
+        y = torch.erf(self.alpha * x.float() + self.shift)
+        return (y * self.weight + self.bias).type_as(x)
+
+
+def convert_rmsnorm_to_derf(model, alpha_init=0.5):
+    """Swap every block's norm1 / norm2 and the head's norm_final for Derf.
+
+    These are the paper's pre-attention (here pre-mixer), pre-FFN and final
+    norms; nothing else is touched (SS2D's post-scan LayerNorm, attention q/k
+    norms). Like the official convert_rmsnorm_to_derf it runs on the built
+    model, and Derf's init draws no random numbers, so every other weight is
+    exactly the RMSNorm model's for the same seed. Returns the swap count.
+    """
+    n = 0
+    for module in list(model.modules()):
+        for name in ("norm1", "norm2", "norm_final"):
+            old = getattr(module, name, None)
+            if isinstance(old, RMSNorm):
+                setattr(module, name, Derf(old.weight.numel(), alpha_init))
+                n += 1
+    return n
+
+
 # ── Positional embeddings ─────────────────────────────────────────────────────
 
 # --- Attention notebook (jit-cifar10, Cell 7) ---

@@ -1,0 +1,85 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D) on Tiny-ImageNet 64x64 — Derf instead of RMSNorm
+# ------------------------------------------------------------
+# adaLN-Zero baseline scaffold with every block's pre-mixer and pre-FFN
+# RMSNorm (norm1, norm2) and the head's norm_final replaced by Dynamic erf
+# (Chen et al., "Stronger Normalization-Free Transformers", CVPR 2026):
+#   Derf(x) = weight * erf(alpha * x + shift) + bias
+# alpha, shift: learnable scalars, init 0.5 and 0; weight, bias: per channel,
+# init 1 and 0. These are the positions the paper replaces (pre-attention,
+# pre-FFN, final). SS2D's post-scan LayerNorm (out_norm) is NOT a pre-norm
+# and the paper never tested it there, so it stays.
+#
+# 25 norms x (D + 2) = +9,650 params (a bias per channel and alpha, shift).
+# Every other weight equals the baseline's for the same seed (Derf's init
+# draws no random numbers). adaLN-Zero is kept, so the only variable vs the
+# baseline is the norm. (The paper's DiT recipe drops the zero-init for
+# point-wise models; its released code still keeps it on DiT-B's blocks.)
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-derf
+  model: vmamba
+  dataset: imagenet
+  data_dir: ./data/tiny-imagenet-200
+  seed: 42
+
+model:
+  input_size: 64
+  patch_size: 8
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4
+  # -- conditioning arms: all OFF (adaLN-Zero baseline scaffold) --
+  in_context_len: 0                 # in-context prefix OFF
+  state_init: none                  # state-init OFF
+  ssc: none                         # SSC OFF
+  adaln_cond: full                  # adaLN-Zero on both branches (baseline)
+  # -- FFN variant (orthogonal to the arms) --
+  ffn: swiglu                  # swiglu | convglu | glumbconv
+  # -- norm layer (orthogonal to the arms) --
+  norm: derf                   # rmsnorm | derf
+  derf_alpha_init: 0.5         # the paper's default (1.0 for its DiT-XL)
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-derf

@@ -68,6 +68,32 @@ prefix and image tokens. `tests/test_ffn_cpu.py` proves `swiglu` is
 bit-identical to HEAD and that both conv FFNs match verbatim transcriptions of
 the TransNeXt / SANA modules; `scripts/check_ffn_cuda.py` is the GPU check.
 
+## Norm layer (`norm`)
+
+`norm: derf` replaces every block's `norm1` / `norm2` and the head's
+`norm_final` RMSNorm with Dynamic erf (Chen et al., "Stronger
+Normalization-Free Transformers", CVPR 2026),
+`Derf(x) = weight · erf(alpha·x + shift) + bias`: `alpha`, `shift` scalars
+(init `derf_alpha_init` = 0.5, 0), `weight`, `bias` per channel (init 1, 0), computed
+in fp32 like RMSNorm. These are the paper's pre-attention, pre-FFN and final
+positions; SS2D's post-scan `out_norm` and Spatial-Mamba's `LN(y)` are not
+pre-norms, are untested in the paper and stay LayerNorm. Like `ffn` it is
+**orthogonal** to every arm (not in `n_arms`) and exists for `vmamba`,
+`vmamba_sasf`, `spatial_mamba` and `vmamba2`. The swap
+(`src/primitives.py::convert_rmsnorm_to_derf`) runs after `initialize_weights`
+and draws no random numbers, so every other weight equals the RMSNorm model's
+at the same seed; adaLN-Zero is kept (the paper's DiT recipe drops it for
+point-wise norms, but its released code keeps it on DiT-B's blocks).
+
+| `norm` | per swapped norm | Tiny-IN `jit-s2-vmamba-derf` |
+|---|---|---|
+| `rmsnorm` (default) | `weight` | 31,031,616 (baseline) |
+| `derf` | + `bias`, `alpha`, `shift` (D + 2) | 31,041,266 (+25 × 386) |
+
+`tests/test_derf_cpu.py` proves `rmsnorm` is bit-identical to HEAD for all four
+models, that `Derf` matches a verbatim copy of the official `Dynamic_erf`, and
+that exactly 2·depth + 1 norms are swapped with every baseline weight kept.
+
 ## JiT-S2-Spatial-Mamba (`model: spatial_mamba`)
 
 `src/models/spatial_mamba.py` is a **separate model** (`vmamba.py` untouched):
@@ -170,7 +196,7 @@ model and prove it in a CPU test under `tests/` (see
 
 `build_model` is duplicated in `scripts/run_experiment.py` and
 `scripts/evaluate.py`. These have drifted apart before — **update both** whenever
-a model flag is added (for `vmamba`, `spatial_mamba` and `vmamba_sasf` alike), or evaluation
+a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf` and `vmamba2` alike), or evaluation
 will silently build a different model than training did. `scripts/profile_model.py` has no vmamba conditioning pass-through
 at all; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.

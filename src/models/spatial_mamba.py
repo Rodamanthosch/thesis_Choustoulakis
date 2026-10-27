@@ -49,6 +49,7 @@ from src.primitives import (
     RMSNorm, get_2d_sincos_pos_embed,
     TimestepEmbedder, LabelEmbedder,
     BottleneckPatchEmbed, FinalLayer, modulate, _dwconv_tokens,
+    NORMS, convert_rmsnorm_to_derf,
 )
 from src.models.vmamba import FFN_CLASSES
 
@@ -478,11 +479,19 @@ class JiTSpatialMamba(nn.Module):
         #   [[row, col], ...], one per token: scanned just before that grid
         #   cell; None -> all before (0, 0) (DiM head prefix)
         in_context_positions=None,
+        # Norm layer (same choices as JiTVMamba): "rmsnorm" | "derf" in
+        # place of norm1, norm2, norm_final (the mixer's LN(y) stays)
+        norm: str = "rmsnorm",
+        derf_alpha_init: float = 0.5,
     ):
         super().__init__()
         assert ffn in FFN_CLASSES, (
             "Unknown ffn=%r (use %s)" % (ffn, " | ".join(FFN_CLASSES))
         )
+        assert norm in NORMS, (
+            "Unknown norm=%r (use %s)" % (norm, " | ".join(NORMS))
+        )
+        self.norm_type = norm
         assert lpu in LPU_MODES, (
             "Unknown lpu=%r (use %s)" % (lpu, " | ".join(LPU_MODES))
         )
@@ -576,6 +585,8 @@ class JiTSpatialMamba(nn.Module):
 
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
+        if norm == "derf":
+            convert_rmsnorm_to_derf(self, derf_alpha_init)
 
     def initialize_weights(self):
         def _basic_init(m):

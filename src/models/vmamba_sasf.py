@@ -169,6 +169,8 @@ class JiTVMambaSASF(JiTVMamba):
         #   SASF dilations: (1, 3, 5) is the paper's; (1, 2, 3) fits an 8x8 grid
         sasf_dilations=(1, 3, 5),
         ffn: str = "swiglu",
+        norm: str = "rmsnorm",
+        derf_alpha_init: float = 0.5,
     ):
         assert d_state == 1, (
             "JiTVMambaSASF reads the SS2D states through C = 1, which needs "
@@ -180,6 +182,7 @@ class JiTVMambaSASF(JiTVMamba):
             mlp_ratio=mlp_ratio, attn_drop=attn_drop, proj_drop=proj_drop,
             num_classes=num_classes, bottleneck_dim=bottleneck_dim,
             d_state=1, d_conv=d_conv, expand=expand, K=K, ffn=ffn,
+            norm=norm, derf_alpha_init=derf_alpha_init,
         )
         self.sasf_dilations = tuple(sasf_dilations)
         for block in self.blocks:

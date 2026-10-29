@@ -345,7 +345,8 @@ def main():
         sampler     = sampler,
         # ─── BUG #15 FIX: num_workers=12 matches LTH14/JiT main_jit.py ───
         # training.num_workers overrides it (match the CPU cores you get).
-        num_workers = t_cfg.get("num_workers", 12),
+        # int(): a command-line override of a key the YAML lacks stays a str.
+        num_workers = int(t_cfg.get("num_workers", 12)),
         # ────────────────────────────────────────────────────────────────
         pin_memory  = True,
         drop_last   = True,

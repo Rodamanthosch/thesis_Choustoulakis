@@ -48,8 +48,7 @@ diffusion:
   P_mean: -0.8
   P_std: 0.8
   t_eps: 0.05
-  noise_scale: 1.0                   # !! VERIFY for 256x256: JiT scales noise with resolution (Table 9).
-                                     #    Fine for a smoke test; check before the full run.
+  noise_scale: 1.0                   # paper: 1.0 * image_size/256 = 1.0 at 256
 
 cfg:
   label_drop_prob: 0.1

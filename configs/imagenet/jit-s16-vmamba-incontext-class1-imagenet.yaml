@@ -1,0 +1,75 @@
+# ============================================================
+# JiT-S/16-VMamba on ImageNet 256x256 -- in-context prefix, ONE class token
+# jit-s16-vmamba-imagenet.yaml (the baseline) plus the in-context arm, nothing
+# else changed: one token e_y + p_0 (class embedding + its learned slot),
+# prepended once at block 4, leading all 4 CrossScan directions, persisted &
+# updated across blocks, stripped at the end. adaLN-Zero still carries (t, y).
+# Tiny-IN counterpart: jit-s2-vmamba-incontext-class.yaml at in_context_len=1.
+#   L = 256 (blocks 0-3), 257 (blocks 4-11)
+#   model: 31,708,416 params = baseline 31,708,032 + incontext_pos_embed (1 x 384)
+# ============================================================
+
+experiment:
+  name: jit-s16-vmamba-imagenet-incontext-class1
+  model: vmamba
+  dataset: imagenet
+  data_dir: /path/to/imagenet        # overridden by the launcher (folder with train/ + val/)
+  seed: 42
+
+model:
+
+  input_size: 256
+  patch_size: 16                     # 256/16 = 16x16 = 256 tokens
+  in_channels: 3
+  hidden_size: 384                   # S scale
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  bottleneck_dim: 128
+  num_classes: 1000
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4                               # number of CrossScan directions (NOT the token count)
+  # -- in-context prefix arm --
+  in_context_len: 1                  # one class token
+  in_context_start: 4                # prefix injected from block 4 onward (blocks 0-3 pure grid)
+  in_context_content: class          # time_class | class
+  in_context_layout: prefix          # prefix | row
+
+training:
+  epochs: 600                        # as the baseline file; the launchers override it (default 100)
+  batch_size: 1024                   # TOTAL across GPUs -> 128/GPU on 8 (run_experiment divides by world_size)
+  warmup_epochs: 5
+  blr: 5.0e-5                        # lr = blr * total_batch/256 = 2e-4 (JiT ImageNet lr)
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0                   # JiT README: 1.0 at 256x256 (2.0 at 512)
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5                     # sweep [1.0, 4.0] at eval
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+  amp: true                        # bf16 autocast sampling, as JiT engine_jit.py evaluate()
+  n_samples: 50000                 # FID-50K / IS-50K (50 per class), the JiT protocol; --n_samples overrides
+
+checkpoint:
+  save_last_freq: 1                  # overwrite checkpoint-last.pt every epoch (resume point)
+  save_archive_freq: 50              # keep checkpoint-ep050.pt, -ep100.pt, ... -ep600.pt permanently
+  resume_from: null
+  output_dir: experiments/imagenet/jit-s16-vmamba-incontext-class1

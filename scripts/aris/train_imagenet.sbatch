@@ -10,7 +10,7 @@
 # RNG state rides along, so the chain equals one uninterrupted run.
 #
 # Environment (from submit_imagenet.sh):
-#   MODEL     jit | vim | vmamba | spatial | spatial-nogate | vmamba2 | sasf   (required)
+#   MODEL     jit | vim | vmamba | vmamba-incontext1 | spatial | spatial-nogate | vmamba2 | sasf   (required)
 #   EPOCHS    total epochs of the run                              (default 100)
 #   ACCUM     training.accum_iter; global batch stays 1024         (default 1)
 #   JIM_ROOT  folder made by scripts/icarus/setup_env.sh           (default ARIS work dir)
@@ -23,7 +23,7 @@
 #SBATCH --exclusive
 set -euo pipefail
 
-MODEL=${MODEL:?set MODEL (jit|vim|vmamba|spatial|spatial-nogate|vmamba2|sasf)}
+MODEL=${MODEL:?set MODEL (jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|vmamba2|sasf)}
 EPOCHS=${EPOCHS:-100}
 ACCUM=${ACCUM:-1}
 JIM_ROOT=${JIM_ROOT:-/gpfs/work/pr019/nspanos/jim}
@@ -36,6 +36,7 @@ case "$MODEL" in
   jit)     CONFIG=configs/imagenet/jit-s-imagenet.yaml ;;
   vim)     CONFIG=configs/imagenet/jit-s2-vim-imagenet.yaml ;;
   vmamba)  CONFIG=configs/imagenet/jit-s16-vmamba-imagenet.yaml ;;
+  vmamba-incontext1) CONFIG=configs/imagenet/jit-s16-vmamba-incontext-class1-imagenet.yaml ;;
   spatial) CONFIG=configs/imagenet/jit-s2-spatial-gate-imagenet.yaml ;;
   spatial-nogate) CONFIG=configs/imagenet/jit-s2-spatial-nogate-imagenet.yaml ;;
   vmamba2) CONFIG=configs/imagenet/jit-s2-vmamba2-imagenet.yaml ;;

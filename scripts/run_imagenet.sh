@@ -34,11 +34,12 @@ case "$MODEL" in
   jit)    CONFIG=configs/imagenet/jit-s-imagenet.yaml ;;
   vim)    CONFIG=configs/imagenet/jit-s2-vim-imagenet.yaml ;;
   vmamba) CONFIG=configs/imagenet/jit-s16-vmamba-imagenet.yaml ;;
+  vmamba-incontext1) CONFIG=configs/imagenet/jit-s16-vmamba-incontext-class1-imagenet.yaml ;;
   spatial) CONFIG=configs/imagenet/jit-s2-spatial-gate-imagenet.yaml ;;
   spatial-nogate) CONFIG=configs/imagenet/jit-s2-spatial-nogate-imagenet.yaml ;;
   vmamba2) CONFIG=configs/imagenet/jit-s2-vmamba2-imagenet.yaml ;;
   sasf)   CONFIG=configs/imagenet/jit-s2-vmamba-sasf-imagenet.yaml ;;
-  *) echo "Usage: bash scripts/run_imagenet.sh <jit|vim|vmamba|spatial|spatial-nogate|vmamba2|sasf> [N_GPUS] [EPOCHS]"; exit 1 ;;
+  *) echo "Usage: bash scripts/run_imagenet.sh <jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|vmamba2|sasf> [N_GPUS] [EPOCHS]"; exit 1 ;;
 esac
 
 echo "=============================================================="

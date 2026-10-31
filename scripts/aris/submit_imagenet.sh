@@ -17,7 +17,8 @@
 #   PARTITION  default gpu
 #   NODES      default 1 (DDP across nodes via torchrun c10d rendezvous)
 #   TIME       wall time per job, default 48:00:00 (the partition's limit)
-#   ACCUM      grad accumulation, default 1 (raise it if 1024/(NODES*GPUS) per GPU OOMs)
+#   ACCUM      grad accumulation, default the config's (S configs 1, B/16 configs 4);
+#              raise it if 1024/(NODES*GPUS*ACCUM) per GPU OOMs
 #   JIM_ROOT   default /gpfs/work/pr019/nspanos/jim (layout of scripts/icarus/setup_env.sh)
 #   DATA_DIR   default $JIM_ROOT/data/imagenet;  OUT default $JIM_ROOT/runs/imagenet/<model>
 #
@@ -27,7 +28,7 @@
 # =============================================================================
 set -euo pipefail
 
-MODEL=${1:?usage: submit_imagenet.sh <jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|vmamba2|sasf> [N_JOBS] [EPOCHS]}
+MODEL=${1:?usage: submit_imagenet.sh <jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|spatial-nogate-b16|vmamba2|sasf> [N_JOBS] [EPOCHS]}
 N_JOBS=${2:-1}
 EPOCHS=${3:-100}
 ACCOUNT=${ACCOUNT:?set ACCOUNT (sacctmgr show assoc user=\$USER format=account)}

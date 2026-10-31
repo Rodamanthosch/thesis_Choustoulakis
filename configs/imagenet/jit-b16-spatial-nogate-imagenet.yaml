@@ -1,0 +1,72 @@
+# ============================================================
+# JiT-B/16-Spatial-Mamba on ImageNet 256x256 -- NO GATE, adaLN only
+# B scale (hidden 768, depth 12, patch 16 = 256 tokens) = JiT-B/16 sizing, as
+# jit-b16-vmamba-imagenet.yaml; the block is jit-s2-spatial-nogate-imagenet.yaml's
+# (1 row-major scan + SASF, no z branch, LPU zero, expand 1, d_state 1).
+# Training recipe identical to jit-b16-vmamba-imagenet.yaml.
+#   model: 118,576,164 params, 18.76 GMACs (B/16-VMamba: 122,594,304 / 20.97;
+#   JiT-B/16: 131,295,744 / 23.20), src/flops_counter.py via evaluate.py::build_model
+# ============================================================
+
+experiment:
+  name: jit-b16-spatial-imagenet-nogate
+  model: spatial_mamba
+  dataset: imagenet
+  data_dir: /path/to/imagenet        # overridden by the launcher (folder with train/ + val/)
+  seed: 42
+
+model:
+  input_size: 256
+  patch_size: 16                     # 256/16 = 16x16 = 256 tokens (JiT-B/16). SAME for all variants.
+  in_channels: 3
+  hidden_size: 768                   # B scale
+  depth: 12
+  num_heads: 12                      # attention-parity arg; unused
+  mlp_ratio: 4.0                     # FFN width: h = int(mlp_ratio * D * 2/3) = 2048
+  bottleneck_dim: 128
+  num_classes: 1000
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 1                         # Spatial-Mamba setting; required
+  d_conv: 3
+  expand: 1                          # as B/16-VMamba (expand 1)
+  gate: false                        # true: LN(y)*SiLU(z) (paper Fig. 4) | false: no z branch
+  sasf_dilations: [1, 3, 5]          # paper's setting for the 16x16 grid
+  lpu: zero                          # Local Perception Units before mixer & FFN: none | zero | paper
+  ffn: swiglu                        # swiglu | convglu | glumbconv
+
+training:
+  epochs: 600                        # JiT paper / README (B/16 at 256); the launchers override it (default 100)
+  batch_size: 1024                   # EFFECTIVE total: micro-batch = 1024 / (world_size * accum_iter)
+  accum_iter: 4                      # 1 GPU: 4 x 256 = 1024; on 4+ GPUs set ACCUM=1 in the launcher
+  warmup_epochs: 5
+  blr: 5.0e-5                        # lr = blr * total_batch/256 = 2e-4 (JiT ImageNet lr)
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05                        # paper Table 9 (clip of 1-t)
+  noise_scale: 1.0                   # paper: 1.0 * image_size/256 = 1.0 at 256
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5                     # sweep at eval
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+  amp: true                        # bf16 autocast sampling, as JiT engine_jit.py evaluate()
+  n_samples: 50000                 # FID-50K / IS-50K (50 per class), the JiT protocol; --n_samples overrides
+
+checkpoint:
+  save_last_freq: 1                  # overwrite checkpoint-last.pt every epoch (resume point)
+  save_archive_freq: 50              # keep checkpoint-ep050.pt, -ep100.pt, ... -ep600.pt permanently
+  resume_from: null
+  output_dir: experiments/imagenet/jit-b16-spatial-nogate

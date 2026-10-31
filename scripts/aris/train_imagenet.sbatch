@@ -10,9 +10,10 @@
 # RNG state rides along, so the chain equals one uninterrupted run.
 #
 # Environment (from submit_imagenet.sh):
-#   MODEL     jit | vim | vmamba | vmamba-incontext1 | spatial | spatial-nogate | vmamba2 | sasf   (required)
+#   MODEL     jit | vim | vmamba | vmamba-incontext1 | spatial | spatial-nogate |
+#             spatial-nogate-b16 | vmamba2 | sasf                  (required)
 #   EPOCHS    total epochs of the run                              (default 100)
-#   ACCUM     training.accum_iter; global batch stays 1024         (default 1)
+#   ACCUM     training.accum_iter; global batch stays 1024         (default: the config's)
 #   JIM_ROOT  folder made by scripts/icarus/setup_env.sh           (default ARIS work dir)
 #   DATA_DIR  folder holding train/                                (default $DATA/imagenet)
 #   OUT       checkpoint folder                                    (default $RUNS/imagenet/$MODEL)
@@ -23,9 +24,9 @@
 #SBATCH --exclusive
 set -euo pipefail
 
-MODEL=${MODEL:?set MODEL (jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|vmamba2|sasf)}
+MODEL=${MODEL:?set MODEL (jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|spatial-nogate-b16|vmamba2|sasf)}
 EPOCHS=${EPOCHS:-100}
-ACCUM=${ACCUM:-1}
+ACCUM=${ACCUM:-}
 JIM_ROOT=${JIM_ROOT:-/gpfs/work/pr019/nspanos/jim}
 [ -f "$JIM_ROOT/env.sh" ] || { echo "FATAL: $JIM_ROOT/env.sh missing -- run scripts/icarus/setup_env.sh with JIM_ROOT=$JIM_ROOT"; exit 1; }
 source "$JIM_ROOT/env.sh" >/dev/null
@@ -39,6 +40,7 @@ case "$MODEL" in
   vmamba-incontext1) CONFIG=configs/imagenet/jit-s16-vmamba-incontext-class1-imagenet.yaml ;;
   spatial) CONFIG=configs/imagenet/jit-s2-spatial-gate-imagenet.yaml ;;
   spatial-nogate) CONFIG=configs/imagenet/jit-s2-spatial-nogate-imagenet.yaml ;;
+  spatial-nogate-b16) CONFIG=configs/imagenet/jit-b16-spatial-nogate-imagenet.yaml ;;
   vmamba2) CONFIG=configs/imagenet/jit-s2-vmamba2-imagenet.yaml ;;
   sasf)    CONFIG=configs/imagenet/jit-s2-vmamba-sasf-imagenet.yaml ;;
   *) echo "FATAL: unknown MODEL=$MODEL"; exit 1 ;;
@@ -56,9 +58,11 @@ WORKERS=${WORKERS:-$(( CPUS / GPUS_PER_NODE - 1 ))}
 (( WORKERS > 12 )) && WORKERS=12
 (( WORKERS < 2 ))  && WORKERS=2
 
-RESUME=()
+EXTRA=()
+# accum_iter only when asked for: the B/16 configs set their own (4).
+[ -n "$ACCUM" ] && EXTRA+=(training.accum_iter="$ACCUM")
 if [ -f "$OUT/checkpoint-last.pt" ]; then
-  RESUME=(checkpoint.resume_from="$OUT/checkpoint-last.pt")
+  EXTRA+=(checkpoint.resume_from="$OUT/checkpoint-last.pt")
 fi
 
 MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
@@ -69,9 +73,9 @@ echo "=============================================================="
 echo "  job $SLURM_JOB_ID on $SLURM_JOB_NODELIST  ($(date '+%F %T'))"
 echo "  model=$MODEL  config=$CONFIG  commit=$(git rev-parse --short HEAD)"
 echo "  nodes=$NNODES x gpus=$GPUS_PER_NODE ($(nvidia-smi --query-gpu=name --format=csv,noheader | head -1))"
-echo "  epochs=$EPOCHS  accum_iter=$ACCUM  workers/gpu=$WORKERS"
+echo "  epochs=$EPOCHS  accum_iter=${ACCUM:-config}  workers/gpu=$WORKERS"
 echo "  data=$DATA_DIR  out=$OUT"
-echo "  resume: ${RESUME[*]:-none (fresh start)}"
+echo "  resume: $([ -f "$OUT/checkpoint-last.pt" ] && echo "$OUT/checkpoint-last.pt" || echo 'none (fresh start)')"
 echo "=============================================================="
 
 srun --ntasks-per-node=1 torchrun \
@@ -80,8 +84,7 @@ srun --ntasks-per-node=1 torchrun \
     scripts/run_experiment.py --config "$CONFIG" \
     experiment.data_dir="$DATA_DIR" \
     training.epochs="$EPOCHS" \
-    training.accum_iter="$ACCUM" \
     training.num_workers="$WORKERS" \
     checkpoint.output_dir="$OUT" \
     checkpoint.save_last_freq=1 \
-    ${RESUME[@]+"${RESUME[@]}"}   # empty-array-safe under set -u on bash < 4.4
+    ${EXTRA[@]+"${EXTRA[@]}"}   # empty-array-safe under set -u on bash < 4.4

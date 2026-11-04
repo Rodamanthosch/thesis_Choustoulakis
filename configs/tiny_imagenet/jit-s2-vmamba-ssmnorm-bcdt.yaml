@@ -1,0 +1,86 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D, d_state 16) on Tiny-ImageNet 64x64 — Jamba's SSM norm
+# ------------------------------------------------------------
+# The adaLN-Zero baseline with Jamba's RMSNorm on the three input-dependent
+# SSM parameters (Lieber et al., arXiv 2403.19887, Sec. 6.4; transformers'
+# JambaMambaMixer dt/b/c_layernorm), applied right after each direction's
+# x_proj split:
+#   dt_r <- g_dt * RMSNorm(dt_r)   dt_rank = 24 wide, BEFORE dt_proj
+#   B    <- g_B  * RMSNorm(B)      d_state = 16 wide
+#   C    <- g_C  * RMSNorm(C)      d_state = 16 wide
+# Learnable gains (init 1), eps 1e-6, statistic in fp32. B and C act as K and
+# Q in the scan's attention form, so this is QK-norm's Mamba analogue; Jamba
+# added it to stop loss spikes from large activations inside its Mamba layers.
+# One gain set per scan direction (each has its own x_proj).
+#
+# +2,688 params (12 blocks x 4 directions x (24 + 16 + 16)) -> 31,034,304.
+# Every other weight equals the baseline's at the same seed (ones-init draws
+# no random numbers); every conditioning arm OFF, so the norm is the only
+# variable vs jit-s2-vmamba-baseline.yaml.
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-ssmnorm-bcdt
+  model: vmamba
+  dataset: imagenet
+  data_dir: ./data/tiny-imagenet-200
+  seed: 42
+
+model:
+  input_size: 64
+  patch_size: 8
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0                    # FFN width: h = int(mlp_ratio * D * 2/3) = 1024
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 4
+  # -- conditioning arms: all OFF (adaLN-Zero baseline scaffold) --
+  in_context_len: 0                 # in-context prefix OFF
+  state_init: none                  # state-init OFF
+  ssc: none                         # SSC OFF
+  adaln_cond: full                  # adaLN-Zero on both branches (baseline)
+  # -- FFN variant (orthogonal to the arms) --
+  ffn: swiglu                  # swiglu | convglu | glumbconv
+  # -- Jamba's RMSNorm on the SSM parameters (orthogonal to the arms) --
+  ssm_norm: bcdt               # none | dt | bcdt
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-ssmnorm-bcdt

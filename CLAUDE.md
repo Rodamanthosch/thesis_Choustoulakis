@@ -94,6 +94,37 @@ point-wise norms, but its released code keeps it on DiT-B's blocks).
 models, that `Derf` matches a verbatim copy of the official `Dynamic_erf`, and
 that exactly 2·depth + 1 norms are swapped with every baseline weight kept.
 
+## SSM-parameter norm (`ssm_norm`)
+
+Jamba's RMSNorm on the input-dependent SSM parameters (Lieber et al., arXiv
+2403.19887, §6.4; transformers' `JambaMambaMixer` `dt/b/c_layernorm`), applied
+right after `x_proj`'s split: `dt_r` (dt_rank wide, **before** `dt_proj`; bias +
+softplus stay in the scan) and B, C (d_state wide). Each is `JambaRMSNorm`:
+learnable per-channel gain init 1, eps 1e-6, statistic in at least fp32
+(`src/primitives.py::ssm_rms_norm`; float64 stays float64, a bf16 input stays
+bf16 so the CUDA scan sees u's dtype). B and C are the scan's key and query
+(`y_i = Σ_j C_iᵀ(Π decay)B_j Δ_j x_j`), so `bcdt` is QK-norm's Mamba analogue.
+Like `ffn` / `norm` it is **orthogonal** (not in `n_arms`), but asserted off
+with `ssc` (offsets B/C after the split) and `state_init` (`B0` bypasses
+`x_proj`): untested pairings. Plain `selective_scan_fn` + autograd, so the
+backward is exact (unlike Falcon Mamba's fused `mamba_inner_fn` route, which
+treats the norm as identity in the backward pass).
+
+| model | `ssm_norm` | gains per block | Tiny-IN config, params |
+|---|---|---|---|
+| `vmamba` | `none` (default) \| `dt` \| `bcdt` (needs d_state ≥ 2) | `dt` K·R, `bcdt` K·(R + 2N), one set per direction, `blocks.*.mixer.{dt,B,C}_norm_weight` (flat 1-D → no weight decay) | `jit-s2-vmamba-ssmnorm-bcdt` 31,034,304 (+2,688) |
+| `spatial_mamba` | `none` (default) \| `dt` | R, `blocks.*.mixer.dt_norm_weight` | `jit-s2-spatial-nogate-ssmnorm-dt` 29,686,404 (+288) |
+
+`bcdt` is rejected at d_state 1 and on `spatial_mamba`: an RMSNorm over one
+B / C value is its sign. `vmamba_sasf` / `vmamba2` are not ported.
+`tests/test_ssm_norm_cpu.py` proves `none` is bit-identical to HEAD for both
+models and the arms next to it, `ssm_rms_norm` == a verbatim `JambaRMSNorm`,
+the SS2D (`bcdt`, `dt`) and Spatial (`dt`) mixers == naive float64
+transcriptions, scale invariance in the normalised x_proj rows, the gains
+(1-D, ones, no decay, gradients), unchanged scan dtypes under bf16, the guards
+and the wiring; `scripts/check_ssm_norm_cuda.py --pair vmamba|spatial` is the
+GPU check (kernel vs `selective_scan_ref`, bf16 fwd+bwd, it/s, peak memory).
+
 ## JiT-S2-Spatial-Mamba (`model: spatial_mamba`)
 
 `src/models/spatial_mamba.py` is a **separate model** (`vmamba.py` untouched):

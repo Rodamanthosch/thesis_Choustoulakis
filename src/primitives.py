@@ -86,6 +86,40 @@ def convert_rmsnorm_to_derf(model, alpha_init=0.5):
     return n
 
 
+# ── Jamba's RMSNorm on the SSM parameters (Lieber et al., arXiv 2403.19887) ───
+# Jamba stabilises its Mamba layers by normalising the three input-dependent
+# SSM parameters right after x_proj's split (transformers' JambaMambaMixer):
+#   dt_r <- RMSNorm(dt_r)   (dt_rank wide, BEFORE dt_proj; softplus(+bias) in the scan)
+#   B    <- RMSNorm(B)      (d_state wide)
+#   C    <- RMSNorm(C)      (d_state wide)
+# each a JambaRMSNorm: learnable per-channel weight (init 1), eps 1e-6, the
+# statistic in fp32. B and C play K and Q in the scan's attention form
+# (y_i = sum_j C_i^T (prod decay) B_j dt_j x_j), so this is QK-norm's analogue.
+#   ssm_norm "none" -> off (the baseline, byte-for-byte)
+#            "dt"   -> the dt_r norm only (all that is meaningful at d_state 1,
+#                      where RMSNorm over one value is just its sign)
+#            "bcdt" -> dt_r, B and C (Jamba; needs d_state >= 2)
+
+SSM_NORMS = ("none", "dt", "bcdt")
+
+
+def ssm_rms_norm(x, weight, dim, eps=1e-6):
+    """JambaRMSNorm.forward over `dim` of x; `weight` already broadcastable.
+
+    Jamba: x in fp32, x * rsqrt(mean(x^2) + eps), cast back to x's dtype,
+    times weight. The product is cast to x's dtype once more so a bf16 input
+    stays bf16 with an fp32 master weight (the CUDA scan needs B, C, dt in
+    u's dtype); in fp32 that cast is a no-op and this is Jamba's op exactly.
+    The statistic is computed in at least fp32 (Jamba's .to(float32) for
+    bf16 / fp16 / fp32) but a float64 input stays float64, so float64
+    reference checks are exact instead of silently fp32.
+    """
+    input_dtype = x.dtype
+    xf = x.to(torch.promote_types(input_dtype, torch.float32))
+    xf = xf * torch.rsqrt(xf.pow(2).mean(dim, keepdim=True) + eps)
+    return (weight * xf.to(input_dtype)).to(input_dtype)
+
+
 # ── Positional embeddings ─────────────────────────────────────────────────────
 
 # --- Attention notebook (jit-cifar10, Cell 7) ---

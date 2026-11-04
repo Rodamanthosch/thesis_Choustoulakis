@@ -26,6 +26,7 @@ from src.primitives import (
     TimestepEmbedder, LabelEmbedder,
     BottleneckPatchEmbed, SwiGLUFFN, ConvGLUFFN, GLUMBConvFFN,
     FinalLayer, modulate, NORMS, convert_rmsnorm_to_derf,
+    SSM_NORMS, ssm_rms_norm,
 )
 
 # FFN variants selectable by `ffn` (orthogonal to the conditioning arms).
@@ -88,6 +89,7 @@ class SS2D(nn.Module):
         state_init: str = "none",     # "none" | "dimsum" | "learned"
         ssc: str = "none",            # "none" | "static" | "bc" | "abc"  (DiM-2 SSC; "static" = bias-only control)
         in_context_layout: str = "prefix",   # "prefix" | "row"  (where the condition tokens sit in the scan)
+        ssm_norm: str = "none",       # "none" | "dt" | "bcdt"  (Jamba's RMSNorm on dt_r / B / C)
     ):
         super().__init__()
         self.d_model = d_model
@@ -208,6 +210,27 @@ class SS2D(nn.Module):
                 self.gate_A_w = nn.Parameter(torch.zeros(K, d_model))
                 self.gate_A_b = nn.Parameter(torch.full((K,), 4.0))
 
+        # ── 7. Jamba's RMSNorm on the SSM parameters (off by default) ──
+        # Right after x_proj's split, each direction's dt_r ("dt", "bcdt") and
+        # B, C ("bcdt") are RMS-normalised over their channels with a learnable
+        # per-channel weight (init 1), as JambaMambaMixer's dt/b/c_layernorm;
+        # dt_r BEFORE dt_projs (Jamba's placement). One weight set per
+        # direction: each direction has its own x_proj, i.e. is its own Jamba
+        # mixer. Stored flat 1-D (K * n) so add_weight_decay treats them as
+        # norm weights (no decay); ones-init draws no random numbers, so every
+        # other weight equals the "none" model's at the same seed.
+        assert ssm_norm in SSM_NORMS, (
+            "Unknown ssm_norm=%r (use %s)" % (ssm_norm, " | ".join(SSM_NORMS)))
+        assert ssm_norm != "bcdt" or d_state >= 2, (
+            "ssm_norm='bcdt' normalises B and C over d_state channels; at "
+            "d_state=%d RMSNorm is just the sign -- use 'dt'" % d_state)
+        self.ssm_norm = ssm_norm
+        if ssm_norm != "none":
+            self.dt_norm_weight = nn.Parameter(torch.ones(K * self.dt_rank))
+        if ssm_norm == "bcdt":
+            self.B_norm_weight = nn.Parameter(torch.ones(K * d_state))
+            self.C_norm_weight = nn.Parameter(torch.ones(K * d_state))
+
     def forward(self, x: torch.Tensor, H: int, W: int,
                 cond: torch.Tensor = None) -> torch.Tensor:
         """
@@ -314,6 +337,15 @@ class SS2D(nn.Module):
         dt_r, B_ssm, C_ssm = torch.split(
             x_dbl, [self.dt_rank, d_state, d_state], dim=2
         )
+        # ── 4-. Jamba's RMSNorm on dt_r (before dt_proj) and B, C (§7) ──
+        if self.ssm_norm != "none":
+            dt_r = ssm_rms_norm(
+                dt_r, self.dt_norm_weight.view(K, -1)[None, :, :, None], dim=2)
+        if self.ssm_norm == "bcdt":
+            B_ssm = ssm_rms_norm(
+                B_ssm, self.B_norm_weight.view(K, -1)[None, :, :, None], dim=2)
+            C_ssm = ssm_rms_norm(
+                C_ssm, self.C_norm_weight.view(K, -1)[None, :, :, None], dim=2)
         dt = torch.einsum("bkrl,kdr->bkdl", dt_r, self.dt_projs_weight)
 
         # ── 4a. DiM-2 SSC: condition-modulated B/C maps (+ A-gate for "abc") ─
@@ -469,7 +501,8 @@ class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=16, d_conv=3, expand=1, K=4,
                  attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none",
-                 in_context_layout="prefix", adaln_cond="full", ffn="swiglu"):
+                 in_context_layout="prefix", adaln_cond="full", ffn="swiglu",
+                 ssm_norm="none"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -477,7 +510,7 @@ class JiTBlock(nn.Module):
             d_model=hidden_size,
             d_state=d_state, d_conv=d_conv, expand=expand, K=K,
             proj_drop=proj_drop, state_init=state_init, ssc=ssc,
-            in_context_layout=in_context_layout,
+            in_context_layout=in_context_layout, ssm_norm=ssm_norm,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -630,6 +663,14 @@ class JiTVMamba(nn.Module):
         #   derf_alpha_init: the paper's 0.5 (1.0 for its DiT-XL)
         norm: str = "rmsnorm",
         derf_alpha_init: float = 0.5,
+        # ── Jamba's RMSNorm on the SSM parameters (orthogonal; not in n_arms) ──
+        #   "none" → the baseline, byte-for-byte
+        #   "dt"   → RMSNorm on each direction's dt_r, before dt_proj
+        #   "bcdt" → + on B and C (Jamba's full scheme, QK-norm's analogue;
+        #            needs d_state >= 2). Learnable gains, init 1.
+        #   Not combined with SSC (which offsets B/C) or state-init (whose B0
+        #   bypasses x_proj): those pairings are untested.
+        ssm_norm: str = "none",
     ):
         super().__init__()
         assert ffn in FFN_CLASSES, (
@@ -638,8 +679,16 @@ class JiTVMamba(nn.Module):
         assert norm in NORMS, (
             "Unknown norm=%r (use %s)" % (norm, " | ".join(NORMS))
         )
+        assert ssm_norm in SSM_NORMS, (
+            "Unknown ssm_norm=%r (use %s)" % (ssm_norm, " | ".join(SSM_NORMS))
+        )
+        assert ssm_norm == "none" or (ssc == "none" and state_init == "none"), (
+            "ssm_norm=%r is not validated with the SSC / state-init arms; "
+            "use it with the baseline or the in-context prefix" % (ssm_norm,)
+        )
         self.ffn = ffn
         self.norm_type = norm
+        self.ssm_norm = ssm_norm
         if isinstance(adaln_cond, bool):          # install_noadaln.sh configs
             adaln_cond = "full" if adaln_cond else "none"
         assert adaln_cond in ("full", "mlp", "none"), (
@@ -744,7 +793,7 @@ class JiTVMamba(nn.Module):
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 state_init=state_init, ssc=ssc,
                 in_context_layout=in_context_layout,
-                adaln_cond=adaln_cond, ffn=ffn,
+                adaln_cond=adaln_cond, ffn=ffn, ssm_norm=ssm_norm,
             )
             for i in range(depth)
         ])

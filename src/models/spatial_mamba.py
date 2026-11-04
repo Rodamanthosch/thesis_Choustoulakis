@@ -49,12 +49,13 @@ from src.primitives import (
     RMSNorm, get_2d_sincos_pos_embed,
     TimestepEmbedder, LabelEmbedder,
     BottleneckPatchEmbed, FinalLayer, modulate, _dwconv_tokens,
-    NORMS, convert_rmsnorm_to_derf,
+    NORMS, convert_rmsnorm_to_derf, ssm_rms_norm,
 )
 from src.models.vmamba import FFN_CLASSES
 
 LPU_MODES = ("none", "zero", "paper")
 STATE_KERNEL_MODES = ("shared", "per_state")   # SASF kernels at d_state > 1
+SPATIAL_SSM_NORMS = ("none", "dt")             # Jamba's dt_r norm; B/C not ported
 
 
 # ── Structure-aware state fusion (SASF) ──────────────────────────────────────
@@ -152,9 +153,14 @@ class StructureAwareSSM(nn.Module):
         dt_max: float = 0.1,
         dt_init_floor: float = 1e-4,
         proj_drop: float = 0.0,
+        ssm_norm: str = "none",
     ):
         super().__init__()
         assert d_state >= 1, d_state
+        assert ssm_norm in SPATIAL_SSM_NORMS, (
+            "Unknown ssm_norm=%r for spatial_mamba (use %s; 'bcdt' is not "
+            "ported: at d_state 1 an RMSNorm over one B / C value is its sign)"
+            % (ssm_norm, " | ".join(SPATIAL_SSM_NORMS)))
         assert state_kernels in STATE_KERNEL_MODES, (
             "Unknown state_kernels=%r (use %s)"
             % (state_kernels, " | ".join(STATE_KERNEL_MODES))
@@ -223,6 +229,15 @@ class StructureAwareSSM(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        # ── 6. Jamba's dt_r RMSNorm (off by default) ─────────────────
+        # "dt": dt_r <- RMSNorm(dt_r) over its dt_rank channels, learnable
+        # weight init 1, BEFORE dt_projs -- JambaMambaMixer's dt_layernorm
+        # (src/primitives.py::ssm_rms_norm). B and C are left alone. Ones-init
+        # draws no random numbers, so every other weight is the "none" model's.
+        self.ssm_norm = ssm_norm
+        if ssm_norm == "dt":
+            self.dt_norm_weight = nn.Parameter(torch.ones(self.dt_rank))
+
     def _scan_order(self, HW: int, device):
         """Index maps between the layout [P tokens, HW grid] and the scan order.
 
@@ -279,6 +294,8 @@ class StructureAwareSSM(nn.Module):
         x_dbl = torch.einsum("bdl,od->bol", u, self.x_proj_weight)
         dt_r, B_ssm, C_ssm = torch.split(
             x_dbl, [self.dt_rank, d_state, d_state], dim=1)     # C_ssm: (B, 1, L)
+        if self.ssm_norm == "dt":   # Jamba's dt_layernorm, before dt_proj (§6)
+            dt_r = ssm_rms_norm(dt_r, self.dt_norm_weight[None, :, None], dim=1)
         dt = torch.einsum("brl,dr->bdl", dt_r, self.dt_projs_weight)
 
         if d_state == 1:
@@ -364,7 +381,7 @@ class JiTSpatialBlock(nn.Module):
                  d_state=1, d_conv=3, expand=1, gate=True,
                  sasf_dilations=(1, 3, 5), lpu="none", sasf_state_kernels="shared",
                  grad_checkpoint=False, in_context_positions=(),
-                 attn_drop=0.0, proj_drop=0.0, ffn="swiglu"):
+                 attn_drop=0.0, proj_drop=0.0, ffn="swiglu", ssm_norm="none"):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -372,6 +389,7 @@ class JiTSpatialBlock(nn.Module):
             d_model=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand,
             gate=gate, dilations=sasf_dilations, state_kernels=sasf_state_kernels,
             in_context_positions=in_context_positions, proj_drop=proj_drop,
+            ssm_norm=ssm_norm,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -483,6 +501,10 @@ class JiTSpatialMamba(nn.Module):
         # place of norm1, norm2, norm_final (the mixer's LN(y) stays)
         norm: str = "rmsnorm",
         derf_alpha_init: float = 0.5,
+        # Jamba's RMSNorm on the SSM parameters (as JiTVMamba's ssm_norm):
+        #   "none" -> the baseline, byte-for-byte | "dt" -> dt_r only, before
+        #   dt_proj. "bcdt" is not ported (B, C are scalars at d_state 1).
+        ssm_norm: str = "none",
     ):
         super().__init__()
         assert ffn in FFN_CLASSES, (
@@ -491,6 +513,11 @@ class JiTSpatialMamba(nn.Module):
         assert norm in NORMS, (
             "Unknown norm=%r (use %s)" % (norm, " | ".join(NORMS))
         )
+        assert ssm_norm in SPATIAL_SSM_NORMS, (
+            "Unknown ssm_norm=%r for spatial_mamba (use %s)"
+            % (ssm_norm, " | ".join(SPATIAL_SSM_NORMS))
+        )
+        self.ssm_norm = ssm_norm
         self.norm_type = norm
         assert lpu in LPU_MODES, (
             "Unknown lpu=%r (use %s)" % (lpu, " | ".join(LPU_MODES))
@@ -578,7 +605,7 @@ class JiTSpatialMamba(nn.Module):
                 in_context_positions=flat_positions,
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
-                ffn=ffn,
+                ffn=ffn, ssm_norm=ssm_norm,
             )
             for i in range(depth)
         ])

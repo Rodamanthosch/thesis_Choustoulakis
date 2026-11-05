@@ -14,6 +14,7 @@ NOTABLE DIFFERENCES vs ViM and attention:
   - Requires: mamba-ssm>=2.2.4 only (no causal-conv1d)
 """
 
+import functools
 import math
 import numpy as np
 import torch
@@ -65,6 +66,57 @@ def cross_merge(ys: torch.Tensor, H: int, W: int) -> torch.Tensor:
     return s1 + s2 + s3 + s4
 
 
+# ── Diagonal in-context layout: tokens tied to grid cells ────────────────────
+# Token e is tied to cell (e*s, e*s), s = grid // n, and sits JUST BEFORE that
+# cell in canonical order. Unlike "prefix"/"row" (inserted after cross_scan, so
+# never flipped), its position is permuted together with the image: before its
+# cell in paths 0/2, AFTER it in the reversed paths 1/3. Over paths 0+1 the
+# token therefore reads every cell (raster-before its cell in 0, from its cell
+# on in 1) and writes to every cell, and again over paths 2+3 column-wise.
+# One token per row AND per column keeps the tokens evenly spaced in both the
+# row-major and column-major scans (stride s*(W+1) / s*(H+1)).
+
+def diagonal_cells(grid: int, n: int):
+    """[(e*s, e*s) for e < n], s = grid // n. n = 0 → [] (the plain grid)."""
+    if n == 0:
+        return []
+    assert n >= 1 and grid % n == 0, (
+        "in_context_layout='diagonal' needs in_context_len dividing the grid "
+        "size %d; got %d" % (grid, n))
+    s = grid // n
+    return [(e * s, e * s) for e in range(n)]
+
+
+@functools.lru_cache(maxsize=None)
+def diagonal_scan_index(H: int, W: int, n: int, device=None):
+    """Gather indices for the 4 SS2D paths with n diagonal tokens.
+
+    Joint layout (what SS2D holds): [n tokens, HW grid cells row-major].
+    idx[k, s] = joint position read at scan step s of path k; inv[k] is its
+    inverse (joint position j sits at scan step inv[k, j]). With n = 0 the
+    grid part reproduces cross_scan's four orders exactly.
+    """
+    assert H == W, (
+        "in_context_layout='diagonal' assumes a square grid (got H=%d, W=%d)"
+        % (H, W))
+    tok = {cell: e for e, cell in enumerate(diagonal_cells(H, n))}
+
+    def order(cells):
+        seq = []
+        for r, c in cells:
+            if (r, c) in tok:
+                seq.append(tok[(r, c)])           # token just before its cell
+            seq.append(n + r * W + c)
+        return seq
+
+    row_major = order((r, c) for r in range(H) for c in range(W))   # path 0
+    col_major = order((r, c) for c in range(W) for r in range(H))   # path 2
+    idx = torch.tensor([row_major, row_major[::-1],
+                        col_major, col_major[::-1]], dtype=torch.long)
+    inv = torch.argsort(idx, dim=1)
+    return idx.to(device), inv.to(device)
+
+
 # ── SS2D (from jit-vmamba-cifar10 Cell 9) ────────────────────────────────────
 
 class SS2D(nn.Module):
@@ -88,7 +140,7 @@ class SS2D(nn.Module):
         proj_drop: float = 0.0,
         state_init: str = "none",     # "none" | "dimsum" | "learned"
         ssc: str = "none",            # "none" | "static" | "bc" | "abc"  (DiM-2 SSC; "static" = bias-only control)
-        in_context_layout: str = "prefix",   # "prefix" | "row"  (where the condition tokens sit in the scan)
+        in_context_layout: str = "prefix",   # "prefix" | "row" | "diagonal"  (where the condition tokens sit in the scan)
         ssm_norm: str = "none",       # "none" | "dt" | "bcdt"  (Jamba's RMSNorm on dt_r / B / C)
     ):
         super().__init__()
@@ -104,7 +156,10 @@ class SS2D(nn.Module):
         #              byte-for-byte path for every previously existing arm)
         #   "row"    → one content unit of U = extra_len // H tokens at the head of
         #              every row (directions 0/1) / column (directions 2/3)
-        assert in_context_layout in ("prefix", "row"), in_context_layout
+        #   "diagonal" → token e tied to cell (e*s, e*s) and permuted WITH the
+        #              image (see diagonal_scan_index), so it reads and writes
+        #              the whole grid in every block
+        assert in_context_layout in ("prefix", "row", "diagonal"), in_context_layout
         self.in_context_layout = in_context_layout
 
         # ── 1. Input projection (no gate branch) ──────────────────────
@@ -269,6 +324,19 @@ class SS2D(nn.Module):
           ([extra_len condition tokens, HW grid tokens]), so persist & update
           and the strip-after-the-last-block are identical.
 
+        in_context_layout == "diagonal" (extra_len > 0):
+          Token e is tied to grid cell (e*s, e*s), s = H // extra_len, and is
+          permuted TOGETHER with the grid (Vim / Mamba-R style) instead of being
+          inserted after cross_scan: just before its cell in paths 0/2, just
+          after it in the reversed paths 1/3. So in every block each token
+          reads the whole grid (cells raster-before its cell in path 0, the
+          rest in path 1; likewise column-wise in 2/3) and writes to the whole
+          grid, which neither the prefix nor the row layout can do. Placement
+          and merge are one gather each (diagonal_scan_index); the grid part of
+          the merge is summed in cross_merge's order, the tokens likewise over
+          the K paths. Model token layout, persist & update and the strip are
+          unchanged.
+
         extra_len == 0 recovers the byte-for-byte baseline path, and
         in_context_layout == "prefix" is byte-for-byte the previous prefix path.
         """
@@ -289,11 +357,22 @@ class SS2D(nn.Module):
         z2d = z_grid.view(B, H, W, d_inner).permute(0, 3, 1, 2).contiguous()
         z2d = self.act(self.conv2d(z2d))                        # (B, d_inner, H, W)
 
-        # ── 3. CrossScan: 4 directions over the pure H×W grid ────────
-        xs = cross_scan(z2d)                                    # (B, K, d_inner, HW)
+        diagonal = extra_len > 0 and self.in_context_layout == "diagonal"
+        if diagonal:
+            # ── 3'. Diagonal: tokens permuted WITH the grid, one gather ──
+            # joint = [tokens, grid row-major]; path k reads joint[idx[k]].
+            assert K == 4, "the diagonal layout is defined for SS2D's 4 paths"
+            idx, _ = diagonal_scan_index(H, W, extra_len, z2d.device)
+            joint = torch.cat(
+                [z_extra.transpose(1, 2).to(z2d.dtype),
+                 z2d.reshape(B, d_inner, HW)], dim=-1)          # (B, d_inner, extra_len+HW)
+            xs = joint[:, :, idx].transpose(1, 2).contiguous()  # (B, K, d_inner, extra_len+HW)
+        else:
+            # ── 3. CrossScan: 4 directions over the pure H×W grid ────────
+            xs = cross_scan(z2d)                                # (B, K, d_inner, HW)
 
         # ── 3b. Place the condition seed into every scan ──────────────
-        if extra_len > 0:
+        if extra_len > 0 and not diagonal:
             # Same seed fed to all K directions; each direction's x_proj[k]
             # still gives it a distinct Δ/B/C.
             seed = z_extra.transpose(1, 2)[:, None]             # (B, 1, d_inner, extra_len)
@@ -462,7 +541,14 @@ class SS2D(nn.Module):
         # ── 5. Merge. Grid: cross_merge (un-permute + sum). ──────────
         #        Extras: plain sum over directions (cross_merge analog; no
         #        un-permute needed — they were never reordered).
-        if extra_len > 0:
+        if diagonal:
+            # Inverse gather per path back to [tokens, grid], summed in
+            # cross_merge's order (path 0 + 1 + 2 + 3).
+            _, inv = diagonal_scan_index(H, W, extra_len, ys.device)
+            out = ys[:, 0][..., inv[0]]
+            for k in range(1, K):
+                out = out + ys[:, k][..., inv[k]]         # (B, d_inner, extra_len+HW)
+        elif extra_len > 0:
             if self.in_context_layout == "prefix":
                 ys_extra = ys[:, :, :, :extra_len]        # (B, K, d_inner, extra_len)
                 ys_grid  = ys[:, :, :, extra_len:]        # (B, K, d_inner, HW)
@@ -610,7 +696,11 @@ class JiTVMamba(nn.Module):
         #              at the head of every row (dirs 0/1) / column (dirs 2/3),
         #              so no image token is more than W scan steps from a
         #              condition token and each unit reads the rows before it
-        in_context_layout: str = "prefix",        # "prefix" | "row"
+        #   "diagonal" → token e tied to cell (e*s, e*s), s = grid_size //
+        #              in_context_len, permuted with the image (before its cell
+        #              in paths 0/2, after it in 1/3): every token reads and
+        #              writes the whole grid in every block. content "class" only.
+        in_context_layout: str = "prefix",        # "prefix" | "row" | "diagonal"
         # ── DiMSUM-style scan-state-init conditioning (off by default) ──
         #   "none"    → baseline / in-context arms (unchanged, byte-for-byte)
         #   "dimsum"  → paper-literal h_{-1} = W_u(c) per direction, per block
@@ -731,10 +821,24 @@ class JiTVMamba(nn.Module):
         self.grid_size = input_size // patch_size
 
         # Learnable positional slots for the prefix tokens (DiM additional_embed).
-        if in_context_layout not in ("prefix", "row"):
+        if in_context_layout not in ("prefix", "row", "diagonal"):
             raise ValueError(
-                "Unknown in_context_layout=%r (use 'prefix' or 'row')"
+                "Unknown in_context_layout=%r (use 'prefix', 'row' or 'diagonal')"
                 % in_context_layout
+            )
+        if in_context_layout == "diagonal":
+            assert in_context_len > 0, (
+                "in_context_layout='diagonal' needs in_context_len > 0 "
+                "(it is a placement for the in-context tokens, not an arm of its own)."
+            )
+            assert self.grid_size % in_context_len == 0, (
+                "in_context_layout='diagonal' ties token e to cell (e*s, e*s), so "
+                "in_context_len must divide the grid size %d; got %d"
+                % (self.grid_size, in_context_len)
+            )
+            assert in_context_content == "class", (
+                "in_context_layout='diagonal' is implemented for "
+                "in_context_content='class' only; got %r" % (in_context_content,)
             )
         if in_context_layout == "row":
             assert in_context_len > 0, (
@@ -904,6 +1008,9 @@ class JiTVMamba(nn.Module):
           content="class":       U=1 → [y]   * grid_size
           Model order is unit-major ([u_0 of row 0, ..., u_{U-1} of row 0, u_0 of
           row 1, ...]) because SS2D reshapes these to (H, U) to interleave them.
+
+        layout="diagonal" (content="class" only): [y] * n, token e tied to grid
+          cell (e*s, e*s) inside SS2D.
 
         A learnable positional slot is added per token (DiM additional_embed), so
         the per-row copies can still specialise.

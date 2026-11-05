@@ -25,9 +25,35 @@ defaults reproduce the adaLN-Zero baseline byte-for-byte.
 | SSC | `ssc: static` \| `bc` \| `abc` |
 | in-context prefix | `in_context_len: K`, `in_context_content: class` \| `time_class`, `in_context_start: 4` |
 | in-context row | the above **plus** `in_context_layout: row` |
+| in-context diagonal | `in_context_len: K`, `in_context_content: class`, `in_context_start: 4`, `in_context_layout: diagonal` |
 
 `in_context_layout` defaults to `prefix`; `row` requires `in_context_len` to be a
 multiple of `grid_size` (and exactly `2 * grid_size` for `time_class`).
+
+`diagonal` ties token e to grid cell (e·s, e·s), s = `grid_size // in_context_len`
+(so `in_context_len` must divide `grid_size`; `class` content only). Unlike
+`prefix` / `row`, which insert after `cross_scan` and are never flipped, its
+position is permuted **with the image** (one gather per path,
+`vmamba.py::diagonal_scan_index`): just before its cell in paths 0/2, just after
+it in the reversed paths 1/3. Same params as `prefix` at the same length; model
+token layout, persist & update and the strip are unchanged.
+
+| 8×8, 8 tokens, per block (DWConv aside) | cells each token reads | cells each token writes to |
+|---|---|---|
+| `prefix` | 0 | 64 |
+| `row` | 0, 28, 48, 60, 64, 64, 64, 64 | 64, 64, 64, 64, 64, 60, 48, 28 |
+| `diagonal` | 64 | 64 |
+
+The diagonal is our own placement: Mamba-R (arXiv 2405.14858) spaces registers
+evenly in the flattened 1-D sequence only, and its 2-D shape depends on the grid
+and register count (diagonal only for 14×14 with 12). What is taken from it is
+the flip of the registers with the sequence. Tiny-IN
+`jit-s2-vmamba-incontext-diagonal-class`: 31,034,688 params, blocks 4–11.
+`tests/test_incontext_diagonal_cpu.py` proves `prefix` / `row` are bit-identical
+to HEAD, the gather with 0 tokens is `cross_scan` / `cross_merge` bit for bit, the
+placement against an independent derivation from `cross_scan`'s orders, the
+round trip, and the read/write table per cell (row and prefix included);
+`scripts/check_incontext_diagonal_cuda.py` is the GPU check.
 
 `adaln_cond` is a **modifier of the SSC arm**, not an arm of its own (it does not
 enter the `n_arms` count): it selects which residual branches adaLN still carries
@@ -217,6 +243,36 @@ fusion against 4 independent `StateFusion`s, identity fusion == `SS2D` and ==
 the whole `JiTVMamba(d_state=1)`, and the mixer against a naive per-direction
 transcription. `scripts/check_sasf_cuda.py` is the GPU check for this model and
 the d_state 16 Spatial runs (exactness, bf16 fwd+bwd, it/s and peak memory).
+
+## JiT-S2-VMamba2 (`model: vmamba2`)
+
+`src/models/vmamba2.py` is a **separate model** (`vmamba.py` untouched): SS2D
+with a **Mamba-2 (SSD) core**, following VMamba's own Mamba-2 variant (`SS2Dm0`,
+`forward_type="m0_noz"`). Everything around the SSM is the baseline SS2D
+(in_proj, DWConv3×3 + SiLU, 4-direction cross-scan/merge, LayerNorm, out_proj,
+no gate); only the core changes: Δ and A one **per head** instead of Δ per
+channel and A per (channel, state). Heads as VMamba m0: `ceil(D/16)` per
+direction (24 × headdim 16 at D=384), B/C one group per direction. Init is the
+Mamba-2 module's (A ~ U[1,16], Δ log-uniform [1e-3, 1e-1]); D per channel as
+in the baseline. Kernel: `mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined`
+(mamba-ssm 2.2.4). Baseline conditioning only; the arms are not ported.
+
+| key | values | meaning |
+|---|---|---|
+| `d_state` | default 16 | 16 = the baseline's total state (24 × 16 × 16 = 384 × 16 per direction) |
+| `nheads` | `null` (default) \| int | heads per direction; `null` → `ceil(D/16)` (VMamba m0) |
+| `chunk_size` | default 64 | SSD chunk (VMamba m0); L = 64 on Tiny-IN is one chunk |
+| `force_fp32` | `false` (default) \| `true` | kernel inputs in fp32 (VMamba m0's flag) — for GPUs whose Triton can't do bf16 `tl.dot` |
+| `expand`, `K`, `ffn` | as `vmamba` | |
+
+Tiny-IN `jit-s2-vmamba2`: 30,278,208 params (mixer 450,048 → 387,264 per block
+vs the Mamba-1 baseline). `tests/test_vmamba2_cpu.py` proves the SSD stub
+against an independent dual form, that the mixer **equals the Mamba-1 SS2D with
+Δ and A tied per head** (check C, float64), and (check G) that the copied
+scaffold is bit-identical to `JiTVMamba`'s. `scripts/check_vmamba2_cuda.py` is
+the GPU check **and** hardware probe: it reports whether the Triton kernel runs
+on the GPU in bf16 / fp32 and prints which `force_fp32` to use. Triton
+officially targets Ampere+; run it on Kaggle T4 before training there.
 
 When adding a new arm, keep the "off" setting byte-identical to the previous
 model and prove it in a CPU test under `tests/` (see

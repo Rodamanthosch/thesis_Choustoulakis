@@ -83,6 +83,7 @@ Every route is selected purely by config flags under `model:`. The arms are **mu
 | SSC | `ssc: static` \| `bc` \| `abc` | `jit-s2-vmamba-ssc-{static,bc,abc}.yaml` |
 | in-context prefix | `in_context_len: K`, `in_context_content: class` \| `time_class`, `in_context_start: 4` | `jit-s2-vmamba-incontext-{class,timeclass}.yaml` |
 | in-context row | the above **plus** `in_context_layout: row` | `jit-s2-vmamba-incontext-row-{class,timeclass}.yaml` |
+| in-context diagonal | `in_context_len: K`, `in_context_content: class`, `in_context_start: 4`, `in_context_layout: diagonal` | `jit-s2-vmamba-incontext-diagonal-class.yaml` |
 
 - `static` adds learned, ones-initialised offsets `B + b₀`, `C + c₀`; `bc` adds zero-initialised condition terms `B + b₀ + W_B c`, `C + c₀ + W_C c`; `abc` also gates the decay per direction.
 - `time_class` prefixes use `[t, y]` (K = 2) or `[t, y, y, t]` (K = 4); `class` repeats the class token K times. Each token gets a learnable positional slot.
@@ -97,9 +98,17 @@ Every route is selected purely by config flags under `model:`. The arms are **mu
 
 Anything but `full` requires `ssc != none` and forbids the in-context prefix. `ssc_z_mlp: true` (only with `mlp` / `none`) gives SSC DiM-2's dedicated `z = MLP(c)`; any surviving adaLN keeps consuming the raw `c`. Configs: `jit-s2-vmamba-ssc-{bc,abc}-ffnadaln.yaml` (`adaln_cond: mlp`, `ssc_z_mlp: true`).
 
-### In-context prefix vs row layout
+### In-context prefix, row and diagonal layouts
 
 `in_context_layout` decides *where* the condition tokens sit inside every SS2D scan: `prefix` stacks them all at the head (DiM), `row` interleaves one content unit at the head of every row (scan directions 0/1) / column (directions 2/3), so no image token is more than `W` scan steps from a condition token. Under `row`, `in_context_len` must be a multiple of the grid size, and `time_class` takes exactly `2 × grid_size` (a `[t,y]` unit per row).
+
+`diagonal` ties token *e* to grid cell (*e·s*, *e·s*), `s = grid_size // in_context_len`, and permutes it together with the image: just before its cell in directions 0/2, just after it in the reversed directions 1/3. `in_context_len` must divide the grid size, and the content must be `class`. With 8 tokens on the 8×8 grid, the three layouts differ in what a token reaches in one block (DWConv aside):
+
+| Layout | Cells each token reads | Cells each token writes to |
+|---|---|---|
+| `prefix` | 0 | 64 |
+| `row` | 0, 28, 48, 60, 64, 64, 64, 64 | 64, 64, 64, 64, 64, 60, 48, 28 |
+| `diagonal` | 64 | 64 |
 
 ```bash
 # one [t,y] unit per row/column — 16 tokens, scan L = 64 + 16
@@ -109,6 +118,10 @@ python scripts/run_experiment.py \
 # one class token per row/column — 8 tokens, scan L = 64 + 8
 python scripts/run_experiment.py \
     --config configs/tiny_imagenet/jit-s2-vmamba-incontext-row-class.yaml
+
+# one class token per grid-diagonal cell — 8 tokens, scan L = 64 + 8, blocks 4–11
+python scripts/run_experiment.py \
+    --config configs/tiny_imagenet/jit-s2-vmamba-incontext-diagonal-class.yaml
 ```
 
 ---
@@ -447,7 +460,7 @@ Complexity comes from `src/flops_counter.py` (fvcore, with hooks for the selecti
 | `model` | `in_context_len` | 0 | In-context tokens (0 = off) |
 | `model` | `in_context_start` | 0 | Block at which the tokens are prepended |
 | `model` | `in_context_content` | `time_class` | `time_class` \| `class` (JiM only) |
-| `model` | `in_context_layout` | `prefix` | `prefix` \| `row` — all at the scan head, or one content unit per row/column (JiM only) |
+| `model` | `in_context_layout` | `prefix` | `prefix` \| `row` \| `diagonal` — all at the scan head, one content unit per row/column, or tied to grid-diagonal cells and permuted with the image (JiM only) |
 | `model` | `state_init` | `none` | `none` \| `dimsum` \| `learned` — condition-dependent scan state (JiM only) |
 | `model` | `ssc` | `none` | `none` \| `static` \| `bc` \| `abc` — semi-separable conditioning of B/C (JiM only) |
 | `model` | `adaln_cond` | `full` | `full` \| `mlp` \| `none` — branches adaLN still conditions; non-`full` needs `ssc` (JiM only) |
@@ -489,10 +502,11 @@ PYTHONPATH=. python tests/test_stateinit_equivalence.py   # state-init == exact 
 PYTHONPATH=. python tests/test_ssc_equivalence.py         # SSC B/C offsets and the exact A-gate identity
 PYTHONPATH=. python tests/test_ssc_static_cpu.py          # ssc=static
 PYTHONPATH=. python tests/test_incontext_row_cpu.py       # row layout; "off" settings bit-identical to HEAD
+PYTHONPATH=. python tests/test_incontext_diagonal_cpu.py  # diagonal layout; prefix/row bit-identical to HEAD
 PYTHONPATH=. python tests/test_adaln_mode_cpu.py          # adaln_cond = full | mlp | none
 ```
 
-`tests/test_stateinit_model.py` and `tests/test_ssc_model.py` need the real `mamba_ssm`. The GPU checks (`scripts/check_stateinit_cuda.py`, `scripts/check_incontext_row_cuda.py`) run at the start of an arm's first Kaggle session.
+`tests/test_stateinit_model.py` and `tests/test_ssc_model.py` need the real `mamba_ssm`. The GPU checks (`scripts/check_stateinit_cuda.py`, `scripts/check_incontext_row_cuda.py`, `scripts/check_incontext_diagonal_cuda.py`) run at the start of an arm's first Kaggle session.
 
 Every new arm keeps its "off" setting byte-identical to the previous model and proves it in a CPU test (state_dict transplant from `git show HEAD:` and `max|diff| == 0`).
 

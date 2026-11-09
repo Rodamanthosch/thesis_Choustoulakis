@@ -174,6 +174,8 @@ def build_model(cfg):
             norm=m.get("norm", "rmsnorm"),
             derf_alpha_init=m.get("derf_alpha_init", 0.5),
             ssm_norm=m.get("ssm_norm", "none"),
+            feature_rope=m.get("feature_rope", "none"),
+            feature_rope_theta=m.get("feature_rope_theta", 10000.0),
         )
     elif arch == "spatial_mamba":
         from src.models.spatial_mamba import JiTSpatialMamba
@@ -197,6 +199,8 @@ def build_model(cfg):
             in_context_content=m.get("in_context_content", "class"),
             in_context_positions=m.get("in_context_positions", None),
             ssm_norm=m.get("ssm_norm", "none"),
+            feature_rope=m.get("feature_rope", "none"),
+            feature_rope_theta=m.get("feature_rope_theta", 10000.0),
         )
     elif arch == "vmamba2":
         from src.models.vmamba2 import JiTVMamba2

@@ -120,6 +120,67 @@ point-wise norms, but its released code keeps it on DiT-B's blocks).
 models, that `Derf` matches a verbatim copy of the official `Dynamic_erf`, and
 that exactly 2·depth + 1 norms are swapped with every baseline weight kept.
 
+## Feature-level RoPE (`feature_rope`)
+
+`src/feature_rope.py`, for `vmamba` and `spatial_mamba` only. A fixed rotation of
+the mixer's **image features**, `rotated_features[position] = R(position) @
+features[position]`, turning each adjacent channel pair by its own angle:
+`[x0, x1] -> [x0 cos a - x1 sin a, x0 sin a + x1 cos a]`. No parameters, buffers
+or RNG. It is a positional modifier (not in `n_arms`) added on top of the
+additive sin-cos embedding, which stays.
+
+| `model:` key | values | meaning |
+|---|---|---|
+| `feature_rope` | `none` (default) \| `1d` \| `2d_axial` | off \| row-major index \| row / column axes |
+| `feature_rope_theta` | default `10000.0` | finite, positive; only read when active |
+
+With D = `d_inner`, cell (r, c) of an H×W grid, integer coordinates from 0 and no
+normalisation or interpolation:
+
+| mode | needs | frequencies | angle of pair j |
+|---|---|---|---|
+| `1d` | D even | `omega[j] = theta ** (-2j/D)`, j < D/2 | `(r*W + c) * omega[j]` |
+| `2d_axial` | 4 divides D | `omega[j] = theta ** (-4j/D)`, j < D/4 | first D/2 channels `r * omega[j]`, last D/2 `c * omega[j]` |
+
+`2d_axial` is JiT's `VisionRotaryEmbeddingFast` construction taken over D feature
+channels instead of head dimensions (bit-identical on an 8×8 grid). Angles and
+tables are computed in fp32 and cached per (mode, theta, D, H, W, device, dtype)
+at module level, outside inference mode and outside every `state_dict`.
+
+Insertion point: `in_proj → DWConv2D → SiLU → FEATURE RoPE`, on the canonical
+grid, in both mixers. In SS2D that is before `cross_scan`, so positions are never
+recomputed per path; the rotated features feed x_proj (Δ, B, C), the scan and the
+D skip term. In Spatial-Mamba they feed x_proj, the scan and `y = C·h + D·u`; the
+gate branch `z` is not rotated. Condition tokens (prefix, row, diagonal, Spatial
+positions) join after the rotation, so they are not rotated and do not shift an
+image coordinate.
+
+**This is an adaptation inspired by RRG-Mamba (Hou et al., IJCAI 2025), not a
+reproduction.** Its Figure 2 places RoPE after DWConv + SiLU and before SS2D, but
+Eq. (10) writes a query-key inner product without saying how that becomes the
+sequence SS2D consumes, and the GDLM code was unavailable. Rotating the features
+is our reading: there is no Q/K projection or similarity matrix, and the SSM
+state, B and C are not rotated directly. RoFormer's relative-position guarantee
+is a property of attention's Q-K product; do not claim it for the Mamba block.
+DPB, the paper's extra gates and convolutions and its report generator are not
+included. `vmamba_sasf`, `vmamba2` and `vim` are not ported.
+
+| Tiny-IN config under `configs/tiny_imagenet/` | params (same as its source) |
+|---|---|
+| `jit-s2-vmamba-feature-rope-{1d,2d-axial}` (d_state 16) | 31,031,616 |
+| `jit-s2-spatial-nogate-feature-rope-{1d,2d-axial}` (d_state 1) | 29,686,116 |
+
+`tests/test_feature_rope_cpu.py` proves `none` is bit-identical to the pre-edit
+models (mixers directly, and the full model with every weight perturbed), both
+rotations against an independent loop-based reference on a rectangular grid, the
+placement (pre-edit mixer + rotation spliced after its SiLU == new mixer; rotated
+cells at their exact position in all four paths; tokens untouched), finite
+forward + backward, strict loading both ways and the train / eval / profile
+builders on the four configs. It uses the stubbed scan, so it does not exercise
+the CUDA kernel; `scripts/check_feature_rope_cuda.py --pair vmamba|spatial --mode 1d|2d_axial`
+is the GPU check, run by the four `notebooks/tiny_imagenet/*-feature-rope-*.ipynb`. Set `FEATURE_ROPE_REFERENCE_DIR` to compare against a saved copy
+of the pre-edit tree; otherwise it uses the last commit before the feature.
+
 ## SSM-parameter norm (`ssm_norm`)
 
 Jamba's RMSNorm on the input-dependent SSM parameters (Lieber et al., arXiv
@@ -284,8 +345,8 @@ model and prove it in a CPU test under `tests/` (see
 `build_model` is duplicated in `scripts/run_experiment.py` and
 `scripts/evaluate.py`. These have drifted apart before — **update both** whenever
 a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf` and `vmamba2` alike), or evaluation
-will silently build a different model than training did. `scripts/profile_model.py` has no vmamba conditioning pass-through
-at all; complexity numbers come from `evaluate.py::build_model` via
+will silently build a different model than training did. `scripts/profile_model.py` passes only `feature_rope` through for vmamba and no conditioning flags
+at all, and does not build `spatial_mamba`; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.
 
 ## Tests

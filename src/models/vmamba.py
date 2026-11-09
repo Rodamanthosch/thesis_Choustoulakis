@@ -29,6 +29,7 @@ from src.primitives import (
     FinalLayer, modulate, NORMS, convert_rmsnorm_to_derf,
     SSM_NORMS, ssm_rms_norm,
 )
+from src.feature_rope import apply_feature_rope, validate_feature_rope
 
 # FFN variants selectable by `ffn` (orthogonal to the conditioning arms).
 FFN_CLASSES = {
@@ -142,6 +143,8 @@ class SS2D(nn.Module):
         ssc: str = "none",            # "none" | "static" | "bc" | "abc"  (DiM-2 SSC; "static" = bias-only control)
         in_context_layout: str = "prefix",   # "prefix" | "row" | "diagonal"  (where the condition tokens sit in the scan)
         ssm_norm: str = "none",       # "none" | "dt" | "bcdt"  (Jamba's RMSNorm on dt_r / B / C)
+        feature_rope: str = "none",   # "none" | "1d" | "2d_axial"  (src/feature_rope.py)
+        feature_rope_theta: float = 10000.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -286,6 +289,11 @@ class SS2D(nn.Module):
             self.B_norm_weight = nn.Parameter(torch.ones(K * d_state))
             self.C_norm_weight = nn.Parameter(torch.ones(K * d_state))
 
+        # ── 8. Feature-level RoPE (off by default; no params, no buffers) ──
+        self.feature_rope = feature_rope
+        self.feature_rope_theta = validate_feature_rope(
+            feature_rope, feature_rope_theta, self.d_inner)
+
     def forward(self, x: torch.Tensor, H: int, W: int,
                 cond: torch.Tensor = None) -> torch.Tensor:
         """
@@ -356,6 +364,13 @@ class SS2D(nn.Module):
         # ── 2. Grid path: reshape → depthwise 2D conv + SiLU ─────────
         z2d = z_grid.view(B, H, W, d_inner).permute(0, 3, 1, 2).contiguous()
         z2d = self.act(self.conv2d(z2d))                        # (B, d_inner, H, W)
+
+        # ── 2b. Feature RoPE: once, on the canonical grid, so the rotation
+        # travels with each cell through all four scan orders and reaches
+        # x_proj (dt, B, C), the scan input and the D skip term. Condition
+        # tokens are still outside the grid here: not rotated, no coordinate.
+        if self.feature_rope != "none":
+            z2d = apply_feature_rope(z2d, self.feature_rope, self.feature_rope_theta)
 
         diagonal = extra_len > 0 and self.in_context_layout == "diagonal"
         if diagonal:
@@ -588,7 +603,7 @@ class JiTBlock(nn.Module):
                  d_state=16, d_conv=3, expand=1, K=4,
                  attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none",
                  in_context_layout="prefix", adaln_cond="full", ffn="swiglu",
-                 ssm_norm="none"):
+                 ssm_norm="none", feature_rope="none", feature_rope_theta=10000.0):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -597,6 +612,7 @@ class JiTBlock(nn.Module):
             d_state=d_state, d_conv=d_conv, expand=expand, K=K,
             proj_drop=proj_drop, state_init=state_init, ssc=ssc,
             in_context_layout=in_context_layout, ssm_norm=ssm_norm,
+            feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -761,8 +777,16 @@ class JiTVMamba(nn.Module):
         #   Not combined with SSC (which offsets B/C) or state-init (whose B0
         #   bypasses x_proj): those pairings are untested.
         ssm_norm: str = "none",
+        # ── Feature-level RoPE (a positional modifier; not in n_arms) ──
+        #   "none"     → the baseline, byte-for-byte
+        #   "1d"       → rotate channel pairs by the row-major grid index
+        #   "2d_axial" → first half of the channels by row, second by column
+        #   See src/feature_rope.py: inspired by RRG-Mamba, not a reproduction.
+        feature_rope: str = "none",
+        feature_rope_theta: float = 10000.0,
     ):
         super().__init__()
+        validate_feature_rope(feature_rope, feature_rope_theta, int(expand * hidden_size))
         assert ffn in FFN_CLASSES, (
             "Unknown ffn=%r (use %s)" % (ffn, " | ".join(FFN_CLASSES))
         )
@@ -898,6 +922,7 @@ class JiTVMamba(nn.Module):
                 state_init=state_init, ssc=ssc,
                 in_context_layout=in_context_layout,
                 adaln_cond=adaln_cond, ffn=ffn, ssm_norm=ssm_norm,
+                feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
             )
             for i in range(depth)
         ])

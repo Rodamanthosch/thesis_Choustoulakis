@@ -51,6 +51,7 @@ from src.primitives import (
     BottleneckPatchEmbed, FinalLayer, modulate, _dwconv_tokens,
     NORMS, convert_rmsnorm_to_derf, ssm_rms_norm,
 )
+from src.feature_rope import apply_feature_rope, validate_feature_rope
 from src.models.vmamba import FFN_CLASSES
 
 LPU_MODES = ("none", "zero", "paper")
@@ -154,6 +155,8 @@ class StructureAwareSSM(nn.Module):
         dt_init_floor: float = 1e-4,
         proj_drop: float = 0.0,
         ssm_norm: str = "none",
+        feature_rope: str = "none",   # "none" | "1d" | "2d_axial"  (src/feature_rope.py)
+        feature_rope_theta: float = 10000.0,
     ):
         super().__init__()
         assert d_state >= 1, d_state
@@ -238,6 +241,11 @@ class StructureAwareSSM(nn.Module):
         if ssm_norm == "dt":
             self.dt_norm_weight = nn.Parameter(torch.ones(self.dt_rank))
 
+        # ── 7. Feature-level RoPE (off by default; no params, no buffers) ──
+        self.feature_rope = feature_rope
+        self.feature_rope_theta = validate_feature_rope(
+            feature_rope, feature_rope_theta, self.d_inner)
+
     def _scan_order(self, HW: int, device):
         """Index maps between the layout [P tokens, HW grid] and the scan order.
 
@@ -283,7 +291,14 @@ class StructureAwareSSM(nn.Module):
 
         # ── 2. depthwise conv + SiLU on the grid, back to row-major ──
         u = u.view(B, H, W, d_inner).permute(0, 3, 1, 2).contiguous()
-        u = self.act(self.conv2d(u)).reshape(B, d_inner, HW)    # (B, d_inner, HW)
+        u = self.act(self.conv2d(u))                            # (B, d_inner, H, W)
+
+        # ── 2a. Feature RoPE on the grid only: u feeds x_proj (dt, B, C), the
+        # scan and the D skip term, all rotated; the gate branch z does not
+        # pass through here, and the tokens have not joined the scan yet.
+        if self.feature_rope != "none":
+            u = apply_feature_rope(u, self.feature_rope, self.feature_rope_theta)
+        u = u.reshape(B, d_inner, HW)                           # (B, d_inner, HW)
 
         # ── 2b. in-context tokens into the scan, before their grid cells ─
         if P:
@@ -381,7 +396,8 @@ class JiTSpatialBlock(nn.Module):
                  d_state=1, d_conv=3, expand=1, gate=True,
                  sasf_dilations=(1, 3, 5), lpu="none", sasf_state_kernels="shared",
                  grad_checkpoint=False, in_context_positions=(),
-                 attn_drop=0.0, proj_drop=0.0, ffn="swiglu", ssm_norm="none"):
+                 attn_drop=0.0, proj_drop=0.0, ffn="swiglu", ssm_norm="none",
+                 feature_rope="none", feature_rope_theta=10000.0):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -390,6 +406,7 @@ class JiTSpatialBlock(nn.Module):
             gate=gate, dilations=sasf_dilations, state_kernels=sasf_state_kernels,
             in_context_positions=in_context_positions, proj_drop=proj_drop,
             ssm_norm=ssm_norm,
+            feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -505,8 +522,13 @@ class JiTSpatialMamba(nn.Module):
         #   "none" -> the baseline, byte-for-byte | "dt" -> dt_r only, before
         #   dt_proj. "bcdt" is not ported (B, C are scalars at d_state 1).
         ssm_norm: str = "none",
+        # Feature-level RoPE (as JiTVMamba's feature_rope; src/feature_rope.py):
+        #   "none" -> the baseline, byte-for-byte | "1d" | "2d_axial"
+        feature_rope: str = "none",
+        feature_rope_theta: float = 10000.0,
     ):
         super().__init__()
+        validate_feature_rope(feature_rope, feature_rope_theta, int(expand * hidden_size))
         assert ffn in FFN_CLASSES, (
             "Unknown ffn=%r (use %s)" % (ffn, " | ".join(FFN_CLASSES))
         )
@@ -606,6 +628,7 @@ class JiTSpatialMamba(nn.Module):
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 ffn=ffn, ssm_norm=ssm_norm,
+                feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
             )
             for i in range(depth)
         ])

@@ -74,6 +74,8 @@ def build_model(cfg):
             num_classes=m["num_classes"], bottleneck_dim=m["bottleneck_dim"],
             d_state=m.get("d_state", 16), d_conv=m.get("d_conv", 3),
             expand=m.get("expand", 1), K=m.get("K", 4),
+            feature_rope=m.get("feature_rope", "none"),
+            feature_rope_theta=m.get("feature_rope_theta", 10000.0),
         )
     raise ValueError(f"Unknown model: {arch}")
 

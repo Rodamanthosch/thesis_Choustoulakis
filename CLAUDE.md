@@ -181,6 +181,48 @@ the CUDA kernel; `scripts/check_feature_rope_cuda.py --pair vmamba|spatial --mod
 is the GPU check, run by the four `notebooks/tiny_imagenet/*-feature-rope-*.ipynb`. Set `FEATURE_ROPE_REFERENCE_DIR` to compare against a saved copy
 of the pre-edit tree; otherwise it uses the last commit before the feature.
 
+## B/C RoPE (`bc_rope`) and A tied in pairs (`a_tie`)
+
+`vmamba` only. RoPE on the scan's **key B and query C**, where it is actually
+relative (unlike `feature_rope`). The scan reads
+`y_i = Σ_j C_iᵀ(Π decay)B_j Δ_j x_j`; rotating B and C in adjacent d_state pairs
+by their cell's 2-D position gives `(R_i C_i)ᵀ decay R_j B_j = C_iᵀ decay R(φ_j − φ_i) B_j`
+**only if both states of every pair share A**. Mamba-1's A is free per
+(channel, state), so `bc_rope` requires `a_tie: pairs`, which needs its own
+control run. Both are modifiers (not in `n_arms`).
+
+| `model:` key | values | meaning |
+|---|---|---|
+| `a_tie` | `none` (default) \| `pairs` | `A_logs` (K, d_inner, N/2), `repeat_interleave(2)` in forward; init = the baseline's even states, A = −[1,1,3,3,…,N−1,N−1]; needs even d_state |
+| `bc_rope` | `none` (default) \| `2d_axial` | rotate B, C after x_proj's split (and after `ssm_norm`); pairs j < N/4 by row, the rest by column, `omega[j] = theta ** (-4j/N)` (feature_rope's 2d_axial over d_state); tables permuted by `cross_scan`, so a cell keeps its angle in all four paths |
+| `bc_rope_theta` | default `10.0` | at d_state 16: 1, .56, .32, .18 rad/cell (θ = 1e4 would leave half the frequencies near zero on 8×8) |
+
+`bc_rope` needs `a_tie: pairs`, d_state divisible by 4, K = 4, and is asserted
+off with in-context tokens, `state_init` and SSC (no angle is defined for a
+token / the virtual position; SSC offsets B, C). It combines with `ssm_norm`
+and `feature_rope`. Δ, B and C still come from unrotated features, the stock
+kernel is unchanged, angles are computed in the work dtype (≥ fp32), and B, C
+reach the scan in their original dtype. Exactness is for the B/C product only:
+the model still sees absolute position (sin-cos, DWConv padding, scan order).
+`vmamba2` would need no tying (scalar A per head) but is not ported;
+`spatial_mamba` (SASF fuses states across cells before C reads them) and
+`vmamba_sasf` (d_state 1) are not either. `src/internals.py` reads `A_logs`
+directly and does not expand a tied one.
+
+| Tiny-IN config under `configs/tiny_imagenet/` | params |
+|---|---|
+| `jit-s2-vmamba-atie` (control) | 30,884,160 (−147,456) |
+| `jit-s2-vmamba-bc-rope-2d-axial` | 30,884,160 (same as the control) |
+
+`tests/test_bc_rope_cpu.py` proves both flags off are bit-identical to commit
+`118940d` (pinned; `BC_ROPE_REFERENCE=<rev>` overrides) for every arm and
+`vmamba_sasf`, the tables against an independent float64 derivation, the mixer
+against a naive float64 transcription (also with `ssm_norm: bcdt`), that a
+constant coordinate shift leaves the output unchanged with A tied (~1e-16) and
+moves it with A free, the params / init / dtypes / guards, and the three
+builders on both configs. `scripts/check_bc_rope_cuda.py --config atie|bc-rope`
+is the GPU check, run by `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-{atie,bc-rope-2d-axial}.ipynb`.
+
 ## SSM-parameter norm (`ssm_norm`)
 
 Jamba's RMSNorm on the input-dependent SSM parameters (Lieber et al., arXiv
@@ -345,7 +387,7 @@ model and prove it in a CPU test under `tests/` (see
 `build_model` is duplicated in `scripts/run_experiment.py` and
 `scripts/evaluate.py`. These have drifted apart before — **update both** whenever
 a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf` and `vmamba2` alike), or evaluation
-will silently build a different model than training did. `scripts/profile_model.py` passes only `feature_rope` through for vmamba and no conditioning flags
+will silently build a different model than training did. `scripts/profile_model.py` passes only `feature_rope`, `a_tie` and `bc_rope` through for vmamba and no conditioning flags
 at all, and does not build `spatial_mamba`; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.
 

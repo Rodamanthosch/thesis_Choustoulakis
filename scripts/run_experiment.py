@@ -176,6 +176,9 @@ def build_model(cfg):
             ssm_norm=m.get("ssm_norm", "none"),
             feature_rope=m.get("feature_rope", "none"),
             feature_rope_theta=m.get("feature_rope_theta", 10000.0),
+            a_tie=m.get("a_tie", "none"),
+            bc_rope=m.get("bc_rope", "none"),
+            bc_rope_theta=m.get("bc_rope_theta", 10.0),
         )
     elif arch == "spatial_mamba":
         from src.models.spatial_mamba import JiTSpatialMamba

@@ -118,6 +118,83 @@ def diagonal_scan_index(H: int, W: int, n: int, device=None):
     return idx.to(device), inv.to(device)
 
 
+# ── B/C RoPE (`bc_rope`) and A tied in state pairs (`a_tie`) ─────────────────
+# The scan reads  y_i = sum_j C_i^T (prod_k exp(dt_k A)) B_j dt_j x_j :  B is the
+# key and C the query. Rotating both by their cell's 2-D position, in adjacent
+# d_state pairs,
+#     (R(phi_i) C_i)^T  decay  R(phi_j) B_j  =  C_i^T  decay  R(phi_j - phi_i) B_j
+# holds exactly when the decay is the same for both states of a rotated pair,
+# i.e. A tied within each pair (a_tie="pairs"); with Mamba-1's free A[d, n] it
+# does not. The angles are feature_rope's "2d_axial" construction taken over
+# the d_state channels (first d_state/2 by row, last d_state/2 by column,
+# omega[j] = theta ** (-4 j / d_state)), permuted by cross_scan, so a cell keeps
+# its rotation in all four paths. Delta, B and C still come from unrotated
+# features; the stock kernel is unchanged. Exactness is for the B/C product
+# only: the model as a whole still sees absolute position (sin-cos embedding,
+# zero-padded DWConv, scan order).
+BC_ROPE_MODES = ("none", "2d_axial")
+A_TIE_MODES = ("none", "pairs")
+
+
+def validate_bc_rope(mode, theta, d_state):
+    """Theta as a float for an active mode, None for "none" (never read)."""
+    if mode not in BC_ROPE_MODES:
+        raise ValueError(
+            "Unknown bc_rope=%r (use %s)" % (mode, " | ".join(BC_ROPE_MODES)))
+    if mode == "none":
+        return None
+    try:
+        if isinstance(theta, bool):
+            raise TypeError
+        value = float(theta)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "bc_rope_theta must be a finite, positive number; got %r" % (theta,)) from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            "bc_rope_theta must be a finite, positive number; got %r" % (theta,))
+    if d_state % 4 != 0:
+        raise ValueError(
+            "bc_rope=%r rotates d_state pairs split over row and column, so "
+            "d_state must be divisible by 4; got %d" % (mode, d_state))
+    return value
+
+
+@functools.lru_cache(maxsize=64)
+def bc_rope_tables(theta, d_state, H, W, device, dtype):
+    """(cos, sin), each (1, 4, d_state/2, H*W): path k, pair j, scan step s.
+
+    Pair j < d_state/4 turns by row * omega[j], pair d_state/4 + j by
+    col * omega[j], omega[j] = theta ** (-4 j / d_state): feature_rope's
+    "2d_axial" over d_state channels. Angles are computed in `dtype` (fp32 in
+    training, float64 in the CPU proofs). Built outside inference mode (like
+    feature_rope's tables) so a table first made by a sampling call never
+    reaches a later backward pass.
+    """
+    with torch.inference_mode(False), torch.no_grad(), \
+            torch.autocast(device_type=device.type, enabled=False):
+        omega = theta ** (-4.0 * torch.arange(d_state // 4, device=device, dtype=dtype)
+                          / d_state)
+        rows = torch.arange(H, device=device, dtype=dtype)
+        cols = torch.arange(W, device=device, dtype=dtype)
+        row_angles = torch.outer(rows, omega)[:, None, :].expand(H, W, -1)
+        col_angles = torch.outer(cols, omega)[None, :, :].expand(H, W, -1)
+        angles = torch.cat([row_angles, col_angles], dim=-1).permute(2, 0, 1)[None]
+        angles = cross_scan(angles.contiguous())          # (1, 4, d_state/2, H*W)
+        return angles.cos(), angles.sin()
+
+
+def apply_bc_rope(v, cos, sin):
+    """Rotate adjacent d_state pairs of v: (B, 4, d_state, L), in >= fp32.
+
+    Returns v's dtype, so the scan sees exactly the dtypes it saw before.
+    """
+    vf = v.to(cos.dtype)
+    v0, v1 = vf[:, :, 0::2], vf[:, :, 1::2]
+    rotated = torch.stack((v0 * cos - v1 * sin, v0 * sin + v1 * cos), dim=3)
+    return rotated.flatten(2, 3).to(v.dtype)
+
+
 # ── SS2D (from jit-vmamba-cifar10 Cell 9) ────────────────────────────────────
 
 class SS2D(nn.Module):
@@ -145,6 +222,9 @@ class SS2D(nn.Module):
         ssm_norm: str = "none",       # "none" | "dt" | "bcdt"  (Jamba's RMSNorm on dt_r / B / C)
         feature_rope: str = "none",   # "none" | "1d" | "2d_axial"  (src/feature_rope.py)
         feature_rope_theta: float = 10000.0,
+        a_tie: str = "none",          # "none" | "pairs"  (A shared by state pairs (2m, 2m+1))
+        bc_rope: str = "none",        # "none" | "2d_axial"  (rotate B and C; needs a_tie="pairs")
+        bc_rope_theta: float = 10.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -204,6 +284,17 @@ class SS2D(nn.Module):
         # A_log: K × (d_inner, d_state). S4 init: A = -[1..N], stored as log.
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         A_log_init = torch.log(A).unsqueeze(0).repeat(K, 1, 1)        # (K, d_inner, d_state)
+        # a_tie="pairs": ONE A per state pair (2m, 2m+1), stored (K, d_inner,
+        # d_state/2) and repeat_interleave'd in forward. Init = the baseline's
+        # even-index states, A = -[1, 3, ..., N-1] (each used twice), which keeps
+        # the baseline's decay range; no random numbers are drawn.
+        assert a_tie in A_TIE_MODES, (
+            "Unknown a_tie=%r (use %s)" % (a_tie, " | ".join(A_TIE_MODES)))
+        assert a_tie == "none" or d_state % 2 == 0, (
+            "a_tie='pairs' needs an even d_state; got %d" % d_state)
+        self.a_tie = a_tie
+        if a_tie == "pairs":
+            A_log_init = A_log_init[..., 0::2].contiguous()           # (K, d_inner, d_state/2)
         self.A_logs = nn.Parameter(A_log_init)
         self.A_logs._no_weight_decay = True
 
@@ -293,6 +384,22 @@ class SS2D(nn.Module):
         self.feature_rope = feature_rope
         self.feature_rope_theta = validate_feature_rope(
             feature_rope, feature_rope_theta, self.d_inner)
+
+        # ── 9. B/C RoPE (off by default; no params, no buffers) ─────────
+        # Rotates each direction's B (key) and C (query) by the cell's 2-D
+        # position after x_proj's split and ssm_norm (see bc_rope_tables).
+        # Relative only with A tied in pairs, hence the assert. Defined on the
+        # image grid of SS2D's four paths: no condition tokens, no virtual
+        # state-init position, no SSC offsets on B / C.
+        self.bc_rope_theta = validate_bc_rope(bc_rope, bc_rope_theta, d_state)
+        if bc_rope != "none":
+            assert a_tie == "pairs", (
+                "bc_rope=%r is relative only when A is tied within each rotated "
+                "state pair; set a_tie='pairs'" % (bc_rope,))
+            assert K == 4, "bc_rope's tables follow cross_scan's 4 paths"
+            assert state_init == "none" and ssc == "none", (
+                "bc_rope is not defined with the state-init / SSC arms")
+        self.bc_rope = bc_rope
 
     def forward(self, x: torch.Tensor, H: int, W: int,
                 cond: torch.Tensor = None) -> torch.Tensor:
@@ -440,6 +547,16 @@ class SS2D(nn.Module):
                 B_ssm, self.B_norm_weight.view(K, -1)[None, :, :, None], dim=2)
             C_ssm = ssm_rms_norm(
                 C_ssm, self.C_norm_weight.view(K, -1)[None, :, :, None], dim=2)
+        # ── 4--. B/C RoPE: key B and query C rotated by their cell (§9) ──
+        if self.bc_rope != "none":
+            assert extra_len == 0, (
+                "bc_rope is defined on the image grid only; got %d condition "
+                "tokens in the scan" % extra_len)
+            cos, sin = bc_rope_tables(
+                self.bc_rope_theta, d_state, H, W, B_ssm.device,
+                torch.promote_types(B_ssm.dtype, torch.float32))
+            B_ssm = apply_bc_rope(B_ssm, cos, sin)
+            C_ssm = apply_bc_rope(C_ssm, cos, sin)
         dt = torch.einsum("bkrl,kdr->bkdl", dt_r, self.dt_projs_weight)
 
         # ── 4a. DiM-2 SSC: condition-modulated B/C maps (+ A-gate for "abc") ─
@@ -506,7 +623,10 @@ class SS2D(nn.Module):
         C_ssm_flat = C_ssm.contiguous().view(B, K, d_state, L)
 
         # A, D, delta_bias always fp32 (small, no upcast cost).
-        A          = -torch.exp(self.A_logs.float()).view(K * d_inner, d_state)
+        A_logs     = self.A_logs.float()
+        if self.a_tie == "pairs":                         # (K, d_inner, d_state/2) -> d_state
+            A_logs = A_logs.repeat_interleave(2, dim=-1)
+        A          = -torch.exp(A_logs).view(K * d_inner, d_state)
         D_param    = self.Ds.float().view(K * d_inner)
         delta_bias = self.dt_projs_bias.float().view(K * d_inner)
 
@@ -603,7 +723,8 @@ class JiTBlock(nn.Module):
                  d_state=16, d_conv=3, expand=1, K=4,
                  attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none",
                  in_context_layout="prefix", adaln_cond="full", ffn="swiglu",
-                 ssm_norm="none", feature_rope="none", feature_rope_theta=10000.0):
+                 ssm_norm="none", feature_rope="none", feature_rope_theta=10000.0,
+                 a_tie="none", bc_rope="none", bc_rope_theta=10.0):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -613,6 +734,7 @@ class JiTBlock(nn.Module):
             proj_drop=proj_drop, state_init=state_init, ssc=ssc,
             in_context_layout=in_context_layout, ssm_norm=ssm_norm,
             feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
+            a_tie=a_tie, bc_rope=bc_rope, bc_rope_theta=bc_rope_theta,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -784,9 +906,29 @@ class JiTVMamba(nn.Module):
         #   See src/feature_rope.py: inspired by RRG-Mamba, not a reproduction.
         feature_rope: str = "none",
         feature_rope_theta: float = 10000.0,
+        # ── A tied in state pairs (orthogonal; not in n_arms) ──
+        #   "none"  → the baseline, byte-for-byte
+        #   "pairs" → one A per state pair (2m, 2m+1): A_logs (K, d_inner,
+        #             d_state/2), init A = -[1,1,3,3,...]; the control for bc_rope
+        a_tie: str = "none",
+        # ── B/C RoPE (a positional modifier; not in n_arms) ──
+        #   "none"     → the baseline, byte-for-byte
+        #   "2d_axial" → rotate B (key) and C (query) in d_state pairs by the
+        #                cell's row / column; needs a_tie="pairs", d_state % 4 == 0,
+        #                and no in-context tokens, state-init or SSC
+        bc_rope: str = "none",
+        bc_rope_theta: float = 10.0,
     ):
         super().__init__()
         validate_feature_rope(feature_rope, feature_rope_theta, int(expand * hidden_size))
+        validate_bc_rope(bc_rope, bc_rope_theta, d_state)
+        assert bc_rope == "none" or (
+            in_context_len == 0 and state_init == "none" and ssc == "none"), (
+            "bc_rope=%r rotates B / C of the image grid only; it is not defined "
+            "with the in-context tokens, state-init or SSC" % (bc_rope,)
+        )
+        self.a_tie = a_tie
+        self.bc_rope = bc_rope
         assert ffn in FFN_CLASSES, (
             "Unknown ffn=%r (use %s)" % (ffn, " | ".join(FFN_CLASSES))
         )
@@ -923,6 +1065,7 @@ class JiTVMamba(nn.Module):
                 in_context_layout=in_context_layout,
                 adaln_cond=adaln_cond, ffn=ffn, ssm_norm=ssm_norm,
                 feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
+                a_tie=a_tie, bc_rope=bc_rope, bc_rope_theta=bc_rope_theta,
             )
             for i in range(depth)
         ])

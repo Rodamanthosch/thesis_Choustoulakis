@@ -28,7 +28,7 @@
 # =============================================================================
 set -euo pipefail
 
-MODEL=${1:?usage: submit_imagenet.sh <jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|spatial-nogate-b16|vmamba2|sasf> [N_JOBS] [EPOCHS]}
+MODEL=${1:?usage: submit_imagenet.sh <jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|spatial-nogate-b16|spatial-nogate-incontext10|spatial-nogate-b16-incontext10|vmamba2|sasf> [N_JOBS] [EPOCHS]}
 N_JOBS=${2:-1}
 EPOCHS=${3:-100}
 ACCOUNT=${ACCOUNT:?set ACCOUNT (sacctmgr show assoc user=\$USER format=account)}

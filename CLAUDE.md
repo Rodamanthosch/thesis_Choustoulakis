@@ -364,6 +364,44 @@ against hand-written block loops (mean init, swaps, strip), strict loading
 across modes, grad checkpointing and both builders;
 `scripts/check_spatial_auxswap_cuda.py --mode swap|noswap` is the GPU check.
 
+## CAN conditional kernels (`dwconv_can`, `sasf_can`, `spatial_mamba` only)
+
+After CAN (Cai et al., CVPR 2024, arXiv 2404.01143: `W + W_c(c)`, per sample
+via one grouped conv; its Table 1 found the depthwise convs the most useful
+layers to condition). **Our adaptation, not a reproduction**: CAN's code was
+never released and the paper does not specify the generator. Two sites, two
+independent flags (modifiers, not arms; not in `n_arms`), each default off and
+byte-identical to the previous model:
+
+| key | generator, shared by ALL blocks | block l convolves sample b with |
+|---|---|---|
+| `dwconv_can` | `can_dwconv.weight`: (9·d_inner, D) | mixer DWConv `K_l + dK_dw(c_b)`, bias unchanged |
+| `sasf_can` | `can_sasf.weight`: (n_dil·9·d_inner, D) | each SASF dilation `K_l,j + dK_sasf(c_b)[j]`, `alpha` unchanged |
+
+- **Generator.** `dK = W SiLU(c)`, with `c = t_emb + y_emb` (the adaLN vector). It has no bias, `W` is zero-init (a raw Parameter, `CANGenerator`) and it runs in at least fp32 with autocast off.
+  - It is computed **once** per forward (`JiTSpatialMamba.can_deltas`) and the same dK is passed to every block.
+  - There is no per-block conditional parameter.
+- **CAN vs ours.** CAN gives each depthwise conv its own generator and shares one generator, with per-layer static weights, only across its output projections. We use that shared device for both sites.
+- **Per-sample conv.** `can_dwconv` computes the kernel sum and a grouped conv over B·C channels (SASF replicate-pads first, one call per dilation). It runs in at least fp32 with autocast off: the input is cast up and the output cast back to the input's dtype.
+- **Zero init.** The generators draw no random numbers, so every other weight equals the flags-off model's at the same seed, and a zero-init model computes the flags-off function.
+- **Guards.** Asserted off with class / aux tokens, `d_state > 1`, `feature_rope`, `ssm_norm`, `norm: derf` and conv FFNs.
+- **Eval switch.** `set_can_zero(dwconv=, sasf=)` drops a site's dK on the same weights, and that site then runs the static path exactly. From the command line: `evaluate.py --can_zero dwconv sasf`.
+
+| Tiny-IN config under `configs/tiny_imagenet/` | params | MACs |
+|---|---|---|
+| `jit-s2-spatial-nogate-can` (both flags) | 34,994,532 (+5,308,416 = 9·D² + 27·D²) | +0.0053 G (the generators) |
+
+`tests/test_spatial_can_cpu.py` proves:
+- flags off are bit-identical to commit `9b454ff` (pinned; `CAN_REFERENCE=<rev>` overrides);
+- the batched mixer equals a per-sample loop of static copies, and the whole model equals a loop over static models with `K_l + G(c_b)` (both float64);
+- a zero-init model equals the flags-off model, and `set_can_zero` equals the static path exactly;
+- G(c) runs once per forward, with the same dK in every block;
+- the parameter counts, the fp32 CAN convs under bf16 autocast, the guards, the diagnostic and both builders.
+
+`scripts/check_spatial_can_cuda.py` is the GPU check: kernel exactness, bf16 fwd+bwd, it/s and memory vs `jit-s2-spatial-nogate`, and fvcore ΔMACs.
+
+`scripts/measure_can.py` is the diagnostic. Per block and site it reports `‖dK‖/‖K_l‖` over t and class. Per site it also reports the class fraction `‖dK(t,y) − mean_y dK(t,·)‖/‖dK‖` and the time fraction (the same over t). It is self-contained, and the notebook `notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-can.ipynb` runs it after eval.
+
 ## JiT-S2-VMamba + SASF (`model: vmamba_sasf`)
 
 `src/models/vmamba_sasf.py` is a **separate model** built from `vmamba.py`
@@ -431,7 +469,9 @@ model and prove it in a CPU test under `tests/` (see
 `build_model` is duplicated in `scripts/run_experiment.py` and
 `scripts/evaluate.py`. These have drifted apart before — **update both** whenever
 a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf` and `vmamba2` alike), or evaluation
-will silently build a different model than training did. `scripts/profile_model.py` passes only `feature_rope`, `a_tie` and `bc_rope` through for vmamba and no conditioning flags
+will silently build a different model than training did. `evaluate.py --can_zero
+dwconv|sasf` (CAN eval ablation, applied after the checkpoint loads) has no
+training counterpart. `scripts/profile_model.py` passes only `feature_rope`, `a_tie` and `bc_rope` through for vmamba and no conditioning flags
 at all, and does not build `spatial_mamba`; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.
 

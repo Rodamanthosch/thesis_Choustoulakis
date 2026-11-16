@@ -143,6 +143,8 @@ def build_model(cfg):
             in_context_positions=m.get("in_context_positions", None),
             aux_tokens=m.get("aux_tokens", "none"),
             aux_tokens_start=m.get("aux_tokens_start", 0),
+            dwconv_can=m.get("dwconv_can", False),
+            sasf_can=m.get("sasf_can", False),
             ssm_norm=m.get("ssm_norm", "none"),
             feature_rope=m.get("feature_rope", "none"),
             feature_rope_theta=m.get("feature_rope_theta", 10000.0),
@@ -229,6 +231,10 @@ def main():
     parser.add_argument("--sampling_amp", type=int, default=None, choices=[0, 1],
                         help="Override sampling.amp from config: 1 = bf16 autocast "
                              "sampling (JiT engine_jit.py), 0 = fp32.")
+    parser.add_argument("--can_zero", nargs="*", default=[], choices=["dwconv", "sasf"],
+                        help="spatial_mamba with dwconv_can / sasf_can: drop the "
+                             "conditional kernel delta at these sites (static "
+                             "kernels only) on the same checkpoint -- eval ablation.")
     args = parser.parse_args()
 
     # ─── BUG #9 FIX: deterministic generation ──────────────────────────────
@@ -271,6 +277,8 @@ def main():
     print(f"  ODE steps   : {s_cfg['steps']}")
     print(f"  Sampling    : {'bf16 autocast (JiT)' if sampling_amp else 'fp32'}")
     print(f"  Seed        : {args.seed}")
+    if args.can_zero:
+        print(f"  CAN zeroed  : {', '.join(args.can_zero)} (static kernels only)")
     print(f"  Device      : {device}")
     print(f"{'='*60}\n")
 
@@ -293,8 +301,11 @@ def main():
     denoiser.init_ema()
     load_checkpoint(args.checkpoint, denoiser, map_location=device)
     print(f"✅ Checkpoint loaded\n")
+    if args.can_zero:   # a module flag, not a weight: survives the EMA swap
+        assert hasattr(net, "set_can_zero"), "--can_zero needs a spatial_mamba CAN model"
+        net.set_can_zero(dwconv="dwconv" in args.can_zero, sasf="sasf" in args.can_zero)
 
-    results = {}
+    results = {"can_zero": sorted(args.can_zero)} if args.can_zero else {}
 
     # ── 1. Complexity (MACs, params, throughput) ──────────────────────────────
     # ─── BUG #20 FIX: use src/flops_counter.py instead of thop. ─────────────

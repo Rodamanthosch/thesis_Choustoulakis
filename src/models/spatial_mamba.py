@@ -33,7 +33,9 @@ its head, so with SASF every image token can sit within a few scan steps of
 one (see JiTSpatialMamba). Off by default and then byte-for-byte the baseline
 (tests/test_spatial_incontext_cpu.py check A). Optionally SF-Mamba's
 auxiliary patch swapping (aux_tokens: two mean-initialised tokens at the head
-and tail of the scan, swapped between blocks; tests/test_spatial_auxswap_cpu.py).
+and tail of the scan, swapped between blocks; tests/test_spatial_auxswap_cpu.py),
+and CAN-style conditional kernels for the mixer DWConv and SASF (dwconv_can /
+sasf_can, our adaptation of Cai et al., CVPR 2024; tests/test_spatial_can_cpu.py).
 State-init, SSC and adaln_cond
 are not ported; src/models/vmamba.py is untouched. The block/model scaffold
 mirrors JiTVMamba line for line (proven by tests/test_spatial_mamba_cpu.py
@@ -63,6 +65,58 @@ SPATIAL_SSM_NORMS = ("none", "dt")             # Jamba's dt_r norm; B/C not port
 AUX_TOKEN_MODES = ("none", "swap", "noswap")   # SF-Mamba aux tokens (+ no-swap control)
 
 
+# ── CAN-style conditional kernels (dwconv_can / sasf_can) ────────────────────
+#
+# After CAN (Cai et al., "Condition-Aware Neural Network for Controlled Image
+# Generation", CVPR 2024, arXiv 2404.01143): a layer's weight becomes W + W_c,
+# W_c generated from the condition, applied per sample by folding the batch
+# into the channels of one grouped conv. THIS IS OUR ADAPTATION, not CAN's
+# code (never released): the paper does not specify the generator (it only
+# prices a "single linear layer"), so ours is one bias-free Linear on SiLU(c),
+# zero-init. CAN gives each depthwise conv its OWN generator and shares one
+# generator (with per-layer static weights) only across its output
+# projections; we use that shared device for both of our sites -- the mixer
+# DWConv and the SASF kernels -- so dK = G(c) is the same in every block and
+# each block keeps its own static K_l.
+
+class CANGenerator(nn.Module):
+    """dK = W SiLU(c), reshaped to out_shape per sample. No bias, W zero-init.
+
+    W is a raw Parameter, not an nn.Linear, so the model's xavier pass skips
+    it and building it draws no random numbers. Computed with autocast off, in
+    at least fp32 (a float64 c stays float64).
+    """
+    def __init__(self, in_dim, out_shape):
+        super().__init__()
+        self.out_shape = tuple(int(s) for s in out_shape)
+        self.weight = nn.Parameter(torch.zeros(math.prod(self.out_shape), in_dim))
+
+    def forward(self, c):
+        wd = torch.promote_types(c.dtype, torch.float32)
+        with torch.autocast(device_type=c.device.type, enabled=False):
+            dk = F.linear(F.silu(c.to(wd)), self.weight.to(wd))
+        return dk.view(c.shape[0], *self.out_shape)
+
+
+def can_dwconv(x, weight, dk, bias=None, padding=0, dilation=1):
+    """Per-sample depthwise conv: sample b convolves with weight + dk[b].
+
+    x: (B, C, H, W), weight: (C, 1, k, k), dk: (B, C, k, k). CAN's
+    batch-to-channel trick: one conv over B*C groups. The kernel sum and the
+    conv run in at least fp32 with autocast off; the output is cast back to
+    x's dtype, so the block downstream sees the static path's dtype.
+    """
+    B, C, H, W = x.shape
+    k = weight.shape[-2:]
+    wd = torch.promote_types(x.dtype, torch.float32)
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        w = (weight.to(wd).view(1, C, *k) + dk.to(wd)).reshape(B * C, 1, *k)
+        b = None if bias is None else bias.to(wd).repeat(B)
+        y = F.conv2d(x.to(wd).reshape(1, B * C, H, W), w, b,
+                     padding=padding, dilation=dilation, groups=B * C)
+    return y.view(B, C, y.shape[-2], y.shape[-1]).to(x.dtype)
+
+
 # ── Structure-aware state fusion (SASF) ──────────────────────────────────────
 
 class StateFusion(nn.Module):
@@ -87,13 +141,21 @@ class StateFusion(nn.Module):
             [nn.Parameter(torch.ones(dim, 1, 3, 3)) for _ in self.dilations])
         self.alpha = nn.Parameter(torch.ones(len(self.dilations)))
 
-    def forward(self, h):
-        """h: (B, dim, H, W) hidden states  ->  fused states, same shape."""
+    def forward(self, h, dk=None):
+        """h: (B, dim, H, W) hidden states  ->  fused states, same shape.
+
+        dk: optional (B, n_dilations, dim, 3, 3) conditional kernels (sasf_can):
+        dilation j uses kernels[j] + dk[:, j] per sample (can_dwconv, fp32);
+        alpha is unchanged. None is the original path.
+        """
         out = 0
-        for a, k, d in zip(self.alpha, self.kernels, self.dilations):
+        for j, (a, k, d) in enumerate(zip(self.alpha, self.kernels, self.dilations)):
             hp = F.pad(h, (d, d, d, d), mode="replicate")
-            out = out + a * F.conv2d(hp, k.to(hp.dtype), padding=0,
-                                     dilation=d, groups=self.dim)
+            if dk is None:
+                out = out + a * F.conv2d(hp, k.to(hp.dtype), padding=0,
+                                         dilation=d, groups=self.dim)
+            else:
+                out = out + a * can_dwconv(hp, k, dk[:, j], dilation=d)
         return out
 
 
@@ -283,9 +345,14 @@ class StructureAwareSSM(nn.Module):
             self._scan_order_cache[key] = (order, torch.argsort(order))
         return self._scan_order_cache[key]
 
-    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, H: int, W: int, can=None) -> torch.Tensor:
+        """can: None, or (dk_dw, dk_sasf) from JiTSpatialMamba.can_deltas, either
+        entry None: per-sample conditional kernels for the DWConv
+        (B, d_inner, k, k) and SASF (B, n_dilations, d_inner, 3, 3). Only at
+        d_state 1 without tokens (asserted by the model)."""
         B, L, _ = x.shape
         d_inner, d_state = self.d_inner, self.d_state
+        dk_dw, dk_sasf = can if can is not None else (None, None)
         HW = H * W
         P = L - HW                     # in-context tokens in front of the grid
         assert P in (0, len(self.in_context_positions)), (
@@ -311,7 +378,11 @@ class StructureAwareSSM(nn.Module):
 
         # ── 2. depthwise conv + SiLU on the grid, back to row-major ──
         u = u.view(B, H, W, d_inner).permute(0, 3, 1, 2).contiguous()
-        u = self.act(self.conv2d(u))                            # (B, d_inner, H, W)
+        if dk_dw is None:
+            u = self.act(self.conv2d(u))                        # (B, d_inner, H, W)
+        else:   # CAN: per-sample kernel conv2d.weight + dk_dw[b] (fp32)
+            u = self.act(can_dwconv(u, self.conv2d.weight, dk_dw, self.conv2d.bias,
+                                    padding=self.d_conv // 2))
 
         # ── 2a. Feature RoPE on the grid only: u feeds x_proj (dt, B, C), the
         # scan and the D skip term, all rotated; the gate branch z does not
@@ -350,7 +421,7 @@ class StructureAwareSSM(nn.Module):
                 s_extra, states = states[..., :P], states[..., P:].contiguous()
 
             # ── 5. SASF over the 2-D grid of states ──────────────────
-            h = self.state_fusion(states.view(B, d_inner, H, W)).reshape(B, d_inner, HW)
+            h = self.state_fusion(states.view(B, d_inner, H, W), dk_sasf).reshape(B, d_inner, HW)
             if P:
                 h = torch.cat([s_extra, h], dim=-1)             # (B, d_inner, P + HW)
 
@@ -454,16 +525,18 @@ class JiTSpatialBlock(nn.Module):
         shape; the P leading in-context tokens see only the centre tap."""
         return _dwconv_tokens(conv, x, H, W)
 
-    def forward(self, x, c, H, W):
+    def forward(self, x, c, H, W, can=None):
+        """can: the model's shared CAN kernel deltas (dk_dw, dk_sasf) or None."""
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             self.adaLN_modulation(c).chunk(6, dim=-1)
         if self.lpu != "none":
             x = x + self._grid_conv(self.cpe1, x, H, W)
         u = modulate(self.norm1(x), shift_msa, scale_msa)
         if self.grad_checkpoint and torch.is_grad_enabled():
-            mix = torch.utils.checkpoint.checkpoint(self.mixer, u, H, W, use_reentrant=False)
+            mix = torch.utils.checkpoint.checkpoint(self.mixer, u, H, W, can,
+                                                    use_reentrant=False)
         else:
-            mix = self.mixer(u, H, W)
+            mix = self.mixer(u, H, W, can)
         x = x + gate_msa.unsqueeze(1) * mix
         if self.lpu != "none":
             x = x + self._grid_conv(self.cpe2, x, H, W)
@@ -508,6 +581,18 @@ class JiTSpatialMamba(nn.Module):
     the mixer DWConv's centre tap + SiLU (no grid neighbours; SF-Mamba's 1-D
     conv also sees the adjacent patch), their states are not fused by SASF,
     and they start at a chosen block, not at the first block of a stage.
+
+    CAN-style conditional kernels (dwconv_can / sasf_can; see CANGenerator --
+    our adaptation of Cai et al., CVPR 2024, not their code). One generator
+    per site, shared by ALL blocks: dK = W SiLU(c) with c the adaLN vector
+    (t + y), W zero-init, no bias, computed once per forward. Block l uses
+    K_l + dK per sample -- the mixer DWConv (bias unchanged) and every SASF
+    dilation's kernel (alpha unchanged) -- in fp32. No per-block conditional
+    parameter. W_dw: 9 * d_inner x D, W_sasf: 9 * n_dilations * d_inner x D
+    (+5,308,416 on the Tiny-IN config). set_can_zero(dwconv=, sasf=) drops a
+    site's dK on the same weights (eval ablation): that site then runs the
+    static code path exactly. Only with the plain setup: no tokens, d_state 1,
+    no feature RoPE / ssm_norm / Derf / conv FFN (asserted).
     """
     def __init__(
         self,
@@ -565,9 +650,23 @@ class JiTSpatialMamba(nn.Module):
         #   "none" -> the baseline, byte-for-byte | "1d" | "2d_axial"
         feature_rope: str = "none",
         feature_rope_theta: float = 10000.0,
+        # CAN-style conditional kernels (off by default; see the class docstring)
+        #   shared generator per site -> K_l + G(c) in every block
+        dwconv_can: bool = False,
+        sasf_can: bool = False,
     ):
         super().__init__()
         validate_feature_rope(feature_rope, feature_rope_theta, int(expand * hidden_size))
+        self.dwconv_can, self.sasf_can = bool(dwconv_can), bool(sasf_can)
+        if self.dwconv_can or self.sasf_can:
+            for bad, why in ((in_context_len > 0, "in-context class tokens"),
+                             (aux_tokens != "none", "aux_tokens"),
+                             (d_state > 1, "d_state > 1"),
+                             (feature_rope != "none", "feature_rope"),
+                             (ssm_norm != "none", "ssm_norm"),
+                             (norm == "derf", "norm: derf"),
+                             (ffn != "swiglu", "conv FFNs")):
+                assert not bad, "dwconv_can / sasf_can are not tested with %s" % why
         assert ffn in FFN_CLASSES, (
             "Unknown ffn=%r (use %s)" % (ffn, " | ".join(FFN_CLASSES))
         )
@@ -690,6 +789,15 @@ class JiTSpatialMamba(nn.Module):
         ])
 
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+
+        # CAN generators: zero Parameters, so no random numbers are drawn and
+        # every other weight is the flags-off model's at the same seed.
+        d_inner = int(expand * hidden_size)
+        if self.dwconv_can:
+            self.can_dwconv = CANGenerator(hidden_size, (d_inner, d_conv, d_conv))
+        if self.sasf_can:
+            self.can_sasf = CANGenerator(hidden_size, (len(sasf_dilations), d_inner, 3, 3))
+        self.can_zero = {"dwconv": False, "sasf": False}
         self.initialize_weights()
         if norm == "derf":
             convert_rmsnorm_to_derf(self, derf_alpha_init)
@@ -748,6 +856,19 @@ class JiTSpatialMamba(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+    def set_can_zero(self, dwconv: bool = False, sasf: bool = False):
+        """Eval ablation: drop dK at a site (static path) on the same weights."""
+        assert not dwconv or self.dwconv_can, "dwconv_can is off in this model"
+        assert not sasf or self.sasf_can, "sasf_can is off in this model"
+        self.can_zero = {"dwconv": bool(dwconv), "sasf": bool(sasf)}
+
+    def can_deltas(self, c):
+        """(dk_dw, dk_sasf) for conditioning vector c, None where a site is off
+        or zeroed; None when both are. Called once per forward."""
+        dk_dw = self.can_dwconv(c) if self.dwconv_can and not self.can_zero["dwconv"] else None
+        dk_sasf = self.can_sasf(c) if self.sasf_can and not self.can_zero["sasf"] else None
+        return None if dk_dw is None and dk_sasf is None else (dk_dw, dk_sasf)
+
     def unpatchify(self, x):
         p = self.patch_size
         c = self.out_channels
@@ -761,6 +882,7 @@ class JiTSpatialMamba(nn.Module):
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y)
         c = t_emb + y_emb
+        can = self.can_deltas(c)        # CAN kernel deltas, once for all blocks
 
         x = self.x_embedder(x)
         x = x + self.pos_embed
@@ -776,7 +898,7 @@ class JiTSpatialMamba(nn.Module):
             if self.aux_tokens != "none" and i == self.aux_tokens_start:
                 m = x.mean(dim=1, keepdim=True)
                 x = torch.cat([m, m, x], dim=1)
-            x = block(x, c, H, W)
+            x = block(x, c, H, W, can)
             # Swap head and tail after every block but the last (out of place).
             if (self.aux_tokens == "swap"
                     and self.aux_tokens_start <= i < len(self.blocks) - 1):

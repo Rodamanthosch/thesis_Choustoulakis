@@ -203,6 +203,8 @@ def build_model(cfg):
             in_context_positions=m.get("in_context_positions", None),
             aux_tokens=m.get("aux_tokens", "none"),
             aux_tokens_start=m.get("aux_tokens_start", 0),
+            dwconv_can=m.get("dwconv_can", False),
+            sasf_can=m.get("sasf_can", False),
             ssm_norm=m.get("ssm_norm", "none"),
             feature_rope=m.get("feature_rope", "none"),
             feature_rope_theta=m.get("feature_rope_theta", 10000.0),

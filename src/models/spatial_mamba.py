@@ -31,7 +31,10 @@ INSIDE the scan (in_context_len / in_context_positions): token e is inserted
 just before grid cell (row_e, col_e) of the row-major scan instead of all at
 its head, so with SASF every image token can sit within a few scan steps of
 one (see JiTSpatialMamba). Off by default and then byte-for-byte the baseline
-(tests/test_spatial_incontext_cpu.py check A). State-init, SSC and adaln_cond
+(tests/test_spatial_incontext_cpu.py check A). Optionally SF-Mamba's
+auxiliary patch swapping (aux_tokens: two mean-initialised tokens at the head
+and tail of the scan, swapped between blocks; tests/test_spatial_auxswap_cpu.py).
+State-init, SSC and adaln_cond
 are not ported; src/models/vmamba.py is untouched. The block/model scaffold
 mirrors JiTVMamba line for line (proven by tests/test_spatial_mamba_cpu.py
 check J), so a JiT-Spatial vs JiT-VMamba run differs only in the mixer and the
@@ -57,6 +60,7 @@ from src.models.vmamba import FFN_CLASSES
 LPU_MODES = ("none", "zero", "paper")
 STATE_KERNEL_MODES = ("shared", "per_state")   # SASF kernels at d_state > 1
 SPATIAL_SSM_NORMS = ("none", "dt")             # Jamba's dt_r norm; B/C not ported
+AUX_TOKEN_MODES = ("none", "swap", "noswap")   # SF-Mamba aux tokens (+ no-swap control)
 
 
 # ── Structure-aware state fusion (SASF) ──────────────────────────────────────
@@ -137,7 +141,9 @@ class StructureAwareSSM(nn.Module):
     SASF fuses the GRID states only; a token's own output is C h + D u of its
     unfused state. Output keeps the input layout [tokens, grid]. With P = 0
     (no tokens, or a block before in_context_start) the forward is the
-    original code path.
+    original code path. p_e = H*W scans token e after the last cell (the
+    SF-Mamba tail token), and token_conv=True gives the tokens the DWConv's
+    centre tap + SiLU instead of skipping it (aux tokens; see JiTSpatialMamba).
     """
     def __init__(
         self,
@@ -149,6 +155,7 @@ class StructureAwareSSM(nn.Module):
         dilations=(1, 3, 5),
         state_kernels: str = "shared",
         in_context_positions=(),
+        token_conv: bool = False,
         dt_rank: int = None,
         dt_min: float = 0.001,
         dt_max: float = 0.1,
@@ -177,6 +184,10 @@ class StructureAwareSSM(nn.Module):
         self.state_kernels = state_kernels
         self.in_context_positions = tuple(sorted(int(p) for p in in_context_positions))
         assert all(p >= 0 for p in self.in_context_positions), self.in_context_positions
+        # token_conv: the tokens get the DWConv's centre tap (+ bias) and SiLU,
+        # as an off-grid 1x1 image (SF-Mamba's aux tokens pass the conv + SiLU).
+        # False (class tokens): raw in_proj output, no conv, no SiLU.
+        self.token_conv = bool(token_conv)
         self._scan_order_cache = {}
 
         # ── 1. Input projection (u, and z when gated) ─────────────────
@@ -250,13 +261,14 @@ class StructureAwareSSM(nn.Module):
         """Index maps between the layout [P tokens, HW grid] and the scan order.
 
         order: scan position -> layout index (token e right before grid cell
-        p_e); inv: layout index -> scan position. seq = cat[..., order] and
+        p_e; p_e == HW means after the last cell, the SF-Mamba tail token);
+        inv: layout index -> scan position. seq = cat[..., order] and
         cat = seq[..., inv].
         """
         key = (HW, str(device))
         if key not in self._scan_order_cache:
             pos, P = self.in_context_positions, len(self.in_context_positions)
-            assert not pos or pos[-1] < HW, (
+            assert not pos or pos[-1] <= HW, (
                 "in-context position %d is outside the %d-cell grid" % (pos[-1], HW))
             order, e = [], 0
             for g in range(HW):
@@ -264,6 +276,9 @@ class StructureAwareSSM(nn.Module):
                     order.append(e)
                     e += 1
                 order.append(P + g)
+            while e < P:                       # pos[e] == HW: after the last cell
+                order.append(e)
+                e += 1
             order = torch.tensor(order, device=device)
             self._scan_order_cache[key] = (order, torch.argsort(order))
         return self._scan_order_cache[key]
@@ -288,6 +303,11 @@ class StructureAwareSSM(nn.Module):
         if P:
             u_extra = u[:, :P].transpose(1, 2)                  # (B, d_inner, P): no grid cell,
             u = u[:, P:]                                        # so no conv (as SS2D)
+            if self.token_conv:                                 # centre tap + SiLU (aux tokens)
+                k = self.d_conv // 2
+                u_extra = self.act(
+                    u_extra * self.conv2d.weight[:, 0, k, k].unsqueeze(-1)
+                    + self.conv2d.bias.unsqueeze(-1))
 
         # ── 2. depthwise conv + SiLU on the grid, back to row-major ──
         u = u.view(B, H, W, d_inner).permute(0, 3, 1, 2).contiguous()
@@ -395,7 +415,7 @@ class JiTSpatialBlock(nn.Module):
     def __init__(self, hidden_size, num_heads=None, mlp_ratio=4.0,
                  d_state=1, d_conv=3, expand=1, gate=True,
                  sasf_dilations=(1, 3, 5), lpu="none", sasf_state_kernels="shared",
-                 grad_checkpoint=False, in_context_positions=(),
+                 grad_checkpoint=False, in_context_positions=(), token_conv=False,
                  attn_drop=0.0, proj_drop=0.0, ffn="swiglu", ssm_norm="none",
                  feature_rope="none", feature_rope_theta=10000.0):
         super().__init__()
@@ -404,8 +424,8 @@ class JiTSpatialBlock(nn.Module):
         self.mixer = StructureAwareSSM(
             d_model=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand,
             gate=gate, dilations=sasf_dilations, state_kernels=sasf_state_kernels,
-            in_context_positions=in_context_positions, proj_drop=proj_drop,
-            ssm_norm=ssm_norm,
+            in_context_positions=in_context_positions, token_conv=token_conv,
+            proj_drop=proj_drop, ssm_norm=ssm_norm,
             feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
@@ -473,6 +493,21 @@ class JiTSpatialMamba(nn.Module):
     on the 8x8 grid with dilations (1, 2, 3), cells (0,3), (3,3), (7,3) put
     every image token within 2 scan steps of a class token (one prefix
     token: 37), +3 tokens of scan length.
+
+    Auxiliary tokens (aux_tokens != "none"), after SF-Mamba's auxiliary
+    patch swapping (Yoshimura et al., ICML 2026, arXiv 2603.16423; official
+    sony/SF-Mamba HybridStage.forward). At block aux_tokens_start two tokens,
+    both the mean of the grid tokens (no parameters, no slot), join the
+    sequence: a HEAD token scanned before cell (0, 0) and a TAIL token scanned
+    after the last cell (layout [head, tail, grid]). The tail's state has read
+    the whole grid; "swap" exchanges the two tokens after every block but the
+    last, so that summary is scanned FIRST in the next block and reaches every
+    cell through the recurrence (future -> past flow from one forward scan).
+    "noswap" is the control: the same tokens, never swapped. Both are
+    stripped after the last block. Deviations from SF-Mamba: the tokens get
+    the mixer DWConv's centre tap + SiLU (no grid neighbours; SF-Mamba's 1-D
+    conv also sees the adjacent patch), their states are not fused by SASF,
+    and they start at a chosen block, not at the first block of a stage.
     """
     def __init__(
         self,
@@ -514,6 +549,10 @@ class JiTSpatialMamba(nn.Module):
         #   [[row, col], ...], one per token: scanned just before that grid
         #   cell; None -> all before (0, 0) (DiM head prefix)
         in_context_positions=None,
+        # SF-Mamba auxiliary tokens (off by default; see the class docstring)
+        #   "none" -> the baseline, byte-for-byte | "swap" | "noswap" (control)
+        aux_tokens: str = "none",
+        aux_tokens_start: int = 0,
         # Norm layer (same choices as JiTVMamba): "rmsnorm" | "derf" in
         # place of norm1, norm2, norm_final (the mixer's LN(y) stays)
         norm: str = "rmsnorm",
@@ -605,6 +644,22 @@ class JiTSpatialMamba(nn.Module):
         self.in_context_positions = cells
         flat_positions = tuple(r * self.grid_size + c for r, c in cells)
 
+        # SF-Mamba auxiliary tokens: head before cell 0, tail after the last.
+        assert aux_tokens in AUX_TOKEN_MODES, (
+            "Unknown aux_tokens=%r (use %s)" % (aux_tokens, " | ".join(AUX_TOKEN_MODES))
+        )
+        self.aux_tokens = aux_tokens
+        self.aux_tokens_start = aux_tokens_start
+        if aux_tokens != "none":
+            assert in_context_len == 0, (
+                "aux_tokens and in-context class tokens are mutually exclusive"
+            )
+            assert 0 <= aux_tokens_start < depth, (
+                "aux_tokens_start=%d must index a block (depth %d)"
+                % (aux_tokens_start, depth)
+            )
+            flat_positions = (0, self.grid_size * self.grid_size)
+
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
         self.x_embedder = BottleneckPatchEmbed(
@@ -625,6 +680,7 @@ class JiTSpatialMamba(nn.Module):
                 sasf_dilations=sasf_dilations, lpu=lpu,
                 sasf_state_kernels=sasf_state_kernels, grad_checkpoint=grad_checkpoint,
                 in_context_positions=flat_positions,
+                token_conv=aux_tokens != "none",
                 attn_drop=attn_drop if (lo <= i < hi) else 0.0,
                 proj_drop=proj_drop if (lo <= i < hi) else 0.0,
                 ffn=ffn, ssm_norm=ssm_norm,
@@ -716,11 +772,21 @@ class JiTSpatialMamba(nn.Module):
             if self.in_context_len > 0 and i == self.in_context_start:
                 ctx = torch.stack([y_emb] * self.in_context_len, dim=1)
                 x = torch.cat([ctx + self.incontext_pos_embed, x], dim=1)
+            # SF-Mamba aux tokens: [head, tail] = mean of the grid tokens, once.
+            if self.aux_tokens != "none" and i == self.aux_tokens_start:
+                m = x.mean(dim=1, keepdim=True)
+                x = torch.cat([m, m, x], dim=1)
             x = block(x, c, H, W)
+            # Swap head and tail after every block but the last (out of place).
+            if (self.aux_tokens == "swap"
+                    and self.aux_tokens_start <= i < len(self.blocks) - 1):
+                x = torch.cat([x[:, 1:2], x[:, 0:1], x[:, 2:]], dim=1)
 
         # Strip the class tokens once, after the final block.
         if self.in_context_len > 0:
             x = x[:, self.in_context_len:, :]
+        if self.aux_tokens != "none":
+            x = x[:, 2:, :]
 
         x = self.final_layer(x, c)
         return self.unpatchify(x)

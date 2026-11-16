@@ -320,6 +320,50 @@ causal, and recomputes the distance figures from the module's scan order;
 `scripts/check_spatial_incontext_cuda.py` is the GPU check (exactness, bf16
 fwd+bwd, it/s and peak memory vs the no-gate run).
 
+## Auxiliary tokens (`aux_tokens`, `spatial_mamba` only)
+
+SF-Mamba's auxiliary patch swapping (Yoshimura et al., ICML 2026, arXiv
+2603.16423; official `sony/SF-Mamba` `HybridStage.forward`) on the one
+row-major Spatial-Mamba scan. At block `aux_tokens_start` two tokens, both the
+**mean of the grid tokens** (no parameters), join as `[head, tail, grid]`: head
+scanned before cell 0, tail after the last cell (`_scan_order` position
+`H*W`). The tail's state has read the whole grid; `swap` exchanges head and
+tail after every block but the last, so that summary is scanned first in the
+next block (future → past flow from one forward scan). Stripped after the last
+block. A modifier, not an arm (not in `n_arms`); asserted off with in-context
+class tokens.
+
+| `model:` key | values | meaning |
+|---|---|---|
+| `aux_tokens` | `none` (default) \| `swap` \| `noswap` | off, byte-for-byte \| SF-Mamba \| control: same tokens, never swapped (paper Table 3) |
+| `aux_tokens_start` | default 0 (configs: 4) | block the tokens join at; swaps after blocks start … depth−2 |
+
+| SF-Mamba | here |
+|---|---|
+| tokens pass the 1-D conv + SiLU with the adjacent patch | mixer DWConv **centre tap** + bias, then SiLU (`StructureAwareSSM(token_conv=True)`); LPU / conv FFN centre tap |
+| first Mamba block of a stage → stripped after the first attention block | `aux_tokens_start` → stripped after the last block |
+| — | tokens' states not fused by SASF; output `C·h + D·u` of their own state |
+| batch folding (eval-time speed trick) | not ported |
+
+| Tiny-IN config under `configs/tiny_imagenet/` | params |
+|---|---|
+| `jit-s2-spatial-nogate-auxswap` (`swap`, from block 4: 7 swaps) | 29,686,116 (+0) |
+| `jit-s2-spatial-nogate-auxnoswap` (`noswap`, control) | 29,686,116 (+0) |
+
+Both are the plain no-gate run plus the two keys; combinations with
+`feature_rope`, `ssm_norm`, `norm: derf`, conv FFNs or d_state > 1 are not
+tested. 0 parameters, so a baseline checkpoint and the other mode's load
+strictly: the notebooks
+(`notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-aux{swap,noswap}.ipynb`)
+resume only from paths containing `aux-swap` / `aux-noswap`.
+`tests/test_spatial_auxswap_cpu.py` proves `none` is bit-identical to commit
+`af4de45` (pinned; `AUX_TOKENS_REFERENCE=<rev>` overrides), also with class
+tokens, the scan order, the mixer against a naive float64 transcription,
+causality (tail reads every cell, head is read by every cell), both modes
+against hand-written block loops (mean init, swaps, strip), strict loading
+across modes, grad checkpointing and both builders;
+`scripts/check_spatial_auxswap_cuda.py --mode swap|noswap` is the GPU check.
+
 ## JiT-S2-VMamba + SASF (`model: vmamba_sasf`)
 
 `src/models/vmamba_sasf.py` is a **separate model** built from `vmamba.py`

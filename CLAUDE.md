@@ -459,6 +459,105 @@ the GPU check **and** hardware probe: it reports whether the Triton kernel runs
 on the GPU in bf16 / fp32 and prints which `force_fp32` to use. Triton
 officially targets Ampere+; run it on Kaggle T4 before training there.
 
+## JiT-S2-VMamba-Global (`model: vmamba_global`)
+
+`src/models/vmamba_global.py` is a **separate model** (`vmamba.py` untouched):
+JiT-S2-VMamba with JiT's persistent class tokens that **never enter the scan**.
+Image↔image mixing is the stock scan; every interaction with a token is linear,
+undecayed and order-free, through the block's own `x_proj[k]` / `dt_proj[k]`.
+
+Per block and direction k, with `v = Δ ⊙ u` for both groups:
+
+- `S_k = (1/M) Σ_m v^e_m B^e_mᵀ` and `G_k = (1/L) Σ_s v_s B_sᵀ`, each (B, d_inner, N),
+  computed in fp32 with autocast off;
+- image paths: `y_k = scan_k + α_xe ⊙ (S_k C_t)`, then `cross_merge`;
+- tokens: `y^e = Σ_k [(α_ee ⊙ S_k + α_ex ⊙ G_k) C^e + D_k ⊙ u^e]`;
+- then out_norm + out_proj on all rows, everything from the same block input.
+
+The kernel call is the baseline's, unchanged (L = 64 in every block). This is
+exact because of the anchored recurrence. Take a = α_xe and Ā = exp(ΔA)
+elementwise. Then `h_t = Ā h_{t−1} + (1 − Ā)(aS) + v_t B_tᵀ` with `h_0 = aS`
+gives `h_t − aS` = the stock state, so `y_t = scan_t + (aS) C_t`. That holds for
+Mamba-1's free A[d, n] (no tying); it does not hold for `softmax`.
+
+| `model:` key | values | meaning |
+|---|---|---|
+| `global_len` | default 16 | M tokens; `0` builds `JiTVMamba`'s baseline exactly |
+| `global_start` | default 4 | block the tokens join at, `[0, depth)` |
+| `global_readback` | `true` (default) \| `false` | `false` = write only: no G, no `alpha_ex`, tokens read S only |
+| `global_kernel_xe` | `linear` (default) \| `softmax` | image←token term `α_xe ⊙ Σ_m softmax_m(C_t·B^e_m/√N) v^e_m` (fp32, no 1/M); token rows stay linear |
+
+**Reused vs new.**
+- `JiTVMambaGlobal` subclasses `JiTVMamba(in_context_len=M, content "class",
+  layout "prefix")`, so slots (`incontext_pos_embed`, std 0.02), insertion,
+  persist & update, strip, adaLN / FFN for the tokens, conv-FFN centre tap and
+  `initialize_weights` are all reused.
+- It then swaps the mixers of blocks `start … depth−1` for `SS2DGlobal(SS2D)`
+  carrying the same weights. The swap runs under `fork_rng`, so the shared
+  weights and the RNG state after construction equal the prefix model's at the
+  same seed.
+
+**Token features differ from the prefix arm:** in_proj → DWConv **centre tap +
+bias** → SiLU (Spatial-Mamba's `token_conv`). vmamba.py's prefix tokens skip both
+the conv and the SiLU, so global vs prefix differs in the token input as well as
+the mixing.
+
+**Gains.** `alpha_xe` / `alpha_ee` / `alpha_ex` are (d_inner,), ones-init, flat
+1-D (no decay). Blocks before `global_start` keep plain `SS2D` with no gains;
+an unused gain there (or write-only's `alpha_ex`) would have `.grad is None`,
+which crashes DDP (built without `find_unused_parameters`).
+
+The **last block** (`depth − 1`, `emit_tokens=False`) holds `alpha_xe` only:
+- its token rows are stripped right after it, so it skips G and the token read
+  (and S under `softmax`);
+- its token rows are just `Σ_k D_k u^e`;
+- `alpha_ee` / `alpha_ex` there would get an all-zero gradient through the strip
+  slice (dead weights, but no DDP error).
+
+**Guards.**
+- Every vmamba.py arm key is accepted only to be asserted off:
+  `in_context_len/layout/content`, `state_init`, `ssc`, `adaln_cond` ≠ full,
+  `ssc_z_mlp`, `ssm_norm`, `feature_rope`, `a_tie`, `bc_rope`. `build_model`
+  passes them, so a config that sets one fails.
+- `ffn` (conv FFNs: tokens get the centre tap, as for the prefix) and
+  `norm: derf` (token-wise) are allowed but untested in training.
+
+| Tiny-IN config under `configs/tiny_imagenet/` | params | GMACs (estimate) |
+|---|---|---|
+| `jit-s2-vmamba-global-full` (M 16) | 31,046,208 | ≈ 1.657 |
+| `jit-s2-vmamba-global-writeonly` (M 16) | 31,043,520 | ≈ 1.646 |
+| `jit-s2-vmamba-global-softmax` (M 16, same shapes as full) | 31,046,208 | ≈ 1.657 |
+| `jit-s2-vmamba-global-full-m32` | 31,052,352 | ≈ 1.867 |
+
+Params are baseline + M·384 (slots) + 384·(3 or 2)·7 (blocks 4–10) + 384 (block 11).
+The notebooks
+(`notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-global-{full-m16,writeonly-m16,softmax-m16,full-m32}.ipynb`)
+resume only from paths containing that tag; full and softmax load into each other
+strictly.
+
+`tests/test_vmamba_global_cpu.py` proves:
+- `global_len: 0` is bit-identical to `JiTVMamba`, and the no-token mixer is `SS2D`;
+- the shared init equals the prefix model's;
+- the mixer equals a naive float64 transcription of the four-block matrix
+  `[[α_ee/M C_eB_eᵀ, α_ex/L C_eB_xᵀ],[α_xe/M C_xB_eᵀ, K_xx]]` (all three modes,
+  with and without `emit_tokens`, rectangular grid);
+- the anchored recurrence;
+- token-permutation equivariance, S / G order independence, D counted once;
+- bf16 with fp32 memories;
+- counts, no dead parameters, strict loading, guards, and both `build_model`s.
+
+`scripts/check_vmamba_global_cuda.py --config full|writeonly|softmax|full-m32`
+is the GPU check (kernel vs ref, bf16, it/s, peak memory and fvcore MACs vs the
+baseline and the m = 16 / 32 prefixes). `scripts/measure_vmamba_global.py` is
+the diagnostic, per block and direction over t and class:
+- `‖α_xe·read‖/‖scan‖`;
+- the effective rank of S_k;
+- `‖G‖/‖S‖`.
+
+It uses training images, the only labelled split. `src/internals.py` /
+`scripts/measure_internals.py` are not ported: the model reports
+`in_context_len == M`, but its tokens are not in the scan.
+
 When adding a new arm, keep the "off" setting byte-identical to the previous
 model and prove it in a CPU test under `tests/` (see
 `tests/test_incontext_row_cpu.py` check A, which transplants weights from
@@ -468,11 +567,11 @@ model and prove it in a CPU test under `tests/` (see
 
 `build_model` is duplicated in `scripts/run_experiment.py` and
 `scripts/evaluate.py`. These have drifted apart before — **update both** whenever
-a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf` and `vmamba2` alike), or evaluation
+a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf`, `vmamba2` and `vmamba_global` alike), or evaluation
 will silently build a different model than training did. `evaluate.py --can_zero
 dwconv|sasf` (CAN eval ablation, applied after the checkpoint loads) has no
 training counterpart. `scripts/profile_model.py` passes only `feature_rope`, `a_tie` and `bc_rope` through for vmamba and no conditioning flags
-at all, and does not build `spatial_mamba`; complexity numbers come from `evaluate.py::build_model` via
+at all, and does not build `spatial_mamba` or `vmamba_global`; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.
 
 ## Tests

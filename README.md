@@ -53,6 +53,10 @@ Patch 8 (8×8 = 64 tokens), S/12 backbone, 100 epochs. FID-10K / IS-10K from 10,
 | Time–class prefix, m = 4 | **88.92** | 6.43 ± 0.14 | 31.03M | 1.481 |
 | SSC-static | 92.63 | 6.07 ± 0.17 | 31.03M | 1.423 |
 | SSC-bc | 94.37 | 5.88 ± 0.13 | 31.62M | 1.423 |
+| Global tokens, M = 16 (`vmamba_global`, full) | pending | pending | 31.05M | ≈1.657 |
+| Global tokens, M = 16, write only | pending | pending | 31.04M | ≈1.646 |
+| Global tokens, M = 16, softmax read | pending | pending | 31.05M | ≈1.657 |
+| Global tokens, M = 32 (full) | pending | pending | 31.05M | ≈1.867 |
 
 Can SSC **replace** adaLN-Zero instead of supplementing it?
 
@@ -84,6 +88,7 @@ Every route is selected purely by config flags under `model:`. The arms are **mu
 | in-context prefix | `in_context_len: K`, `in_context_content: class` \| `time_class`, `in_context_start: 4` | `jit-s2-vmamba-incontext-{class,timeclass}.yaml` |
 | in-context row | the above **plus** `in_context_layout: row` | `jit-s2-vmamba-incontext-row-{class,timeclass}.yaml` |
 | in-context diagonal | `in_context_len: K`, `in_context_content: class`, `in_context_start: 4`, `in_context_layout: diagonal` | `jit-s2-vmamba-incontext-diagonal-class.yaml` |
+| global tokens (separate model) | `experiment.model: vmamba_global`; `global_len: M`, `global_start: 4`, `global_readback: true` \| `false`, `global_kernel_xe: linear` \| `softmax` | `jit-s2-vmamba-global-{full,writeonly,softmax,full-m32}.yaml` |
 
 - `static` adds learned, ones-initialised offsets `B + b₀`, `C + c₀`; `bc` adds zero-initialised condition terms `B + b₀ + W_B c`, `C + c₀ + W_C c`; `abc` also gates the decay per direction.
 - `time_class` prefixes use `[t, y]` (K = 2) or `[t, y, y, t]` (K = 4); `class` repeats the class token K times. Each token gets a learnable positional slot.
@@ -122,6 +127,19 @@ python scripts/run_experiment.py \
 # one class token per grid-diagonal cell — 8 tokens, scan L = 64 + 8, blocks 4–11
 python scripts/run_experiment.py \
     --config configs/tiny_imagenet/jit-s2-vmamba-incontext-diagonal-class.yaml
+```
+
+### Global condition tokens (`model: vmamba_global`)
+
+A separate model (`src/models/vmamba_global.py`) that keeps JiT's persistent class tokens (`y_emb` + a learned slot, joined at block 4, stripped before the head) but **never puts them in the scan**. Image ↔ image mixing is the stock SS2D scan. Per block and direction, the tokens write an undecayed memory `S_k = mean_m (Δu)ᵉ_m Bᵉ_mᵀ` and the image reads it as `scan_k + α ⊙ S_k C_t`. That is exactly the scan started from, and pulled towards, `S_k`, so the CUDA kernel is unchanged. The tokens read `S_k` and the image's own memory `G_k = mean_s (Δu)_s B_sᵀ`.
+
+- `global_readback: false` drops `G_k`: the tokens write, but never read the image.
+- `global_kernel_xe: softmax` replaces the image's linear read with a softmax over the tokens.
+
+Every interaction with a token is order-free and does not decay with scan distance, unlike the prefix / row / diagonal layouts. The scan stays at L = 64.
+
+```bash
+python scripts/run_experiment.py --config configs/tiny_imagenet/jit-s2-vmamba-global-full.yaml
 ```
 
 ---

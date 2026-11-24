@@ -48,7 +48,7 @@ PATCHES:
             folder holds exactly n_samples images.
 """
 
-import argparse, os, sys, json
+import argparse, os, sys, json, math
 import torch
 import torchvision
 import torchvision.transforms as T
@@ -274,6 +274,13 @@ def main():
     parser.add_argument("--can_freeze_sites", nargs="+", default=["dwconv", "sasf"],
                         choices=["dwconv", "sasf"],
                         help="Sites --can_freeze applies to (default: both).")
+    parser.add_argument("--grid", type=int, default=64,
+                        help="Also save grid.png in out_dir: this many of the generated "
+                             "samples, evenly spaced over the label order (0 = off). The "
+                             "sampler is deterministic given its starting noise, so two evals "
+                             "with the same --seed / --batch_size / --n_samples (e.g. plain vs "
+                             "--can_freeze) draw the same noise for every index: their grids "
+                             "compare image for image.")
     args = parser.parse_args()
     assert not (args.can_zero and args.can_freeze), "--can_zero and --can_freeze are exclusive"
     args.can_freeze_sites = sorted(set(args.can_freeze_sites))
@@ -425,6 +432,10 @@ def main():
     all_labels = torch.arange(num_classes).repeat_interleave(per_class).to(device)
     # ────────────────────────────────────────────────────────────────────────
 
+    n_grid = min(max(args.grid, 0), args.n_samples)
+    grid_idx = {k * args.n_samples // n_grid for k in range(n_grid)} if n_grid else set()
+    grid_imgs = {}
+
     denoiser.eval()
     count = 0
     with torch.no_grad(), denoiser.swap_ema(args.ema):
@@ -445,11 +456,18 @@ def main():
             imgs = ((imgs.float().clamp(-1, 1) + 1) / 2).cpu()
             for j in range(bs):
                 save_image(imgs[j], f"{gen_dir}/{count+j:05d}.png")
+                if count + j in grid_idx:
+                    grid_imgs[count + j] = imgs[j]
             count += bs
             pbar.update(bs)
         pbar.close()
     print(f"✅ {count} images saved to {gen_dir}\n")
     check_generated(gen_dir, args.n_samples)
+    if grid_imgs:   # same seed / batch size / n_samples -> same noise at every index
+        save_image(torch.stack([grid_imgs[i] for i in sorted(grid_imgs)]),
+                   os.path.join(out_dir, "grid.png"), nrow=math.ceil(math.sqrt(len(grid_imgs))))
+        print(f"✅ grid.png: samples {min(grid_imgs)}, ..., {max(grid_imgs)} "
+              f"(every {args.n_samples // n_grid}th, label order)\n")
 
     # ── 3–4. ImageNet-1k: FID / IS against JiT's precomputed stats ───────────
     if jit_fid:

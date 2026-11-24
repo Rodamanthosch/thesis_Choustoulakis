@@ -38,7 +38,12 @@ Checks:
      t density (trapezoid on z, 1e-9); zero generators -> NaN shares; the
      constant / time / class / interaction energy shares == a direct two-way
      decomposition of the full (t, class) grid and sum to 1; size ratios;
-     reports written; a dwconv-only model has only the dwconv site.
+     the time component T(t) = mean_y dK(t, .) - m: its SVD energy == the time
+     energy, the per-channel / one-scale projections on K_l + m, the centre
+     share and ||T(t)|| / ||K_l + m|| == naive loops; a rank-1 generator along
+     K_l gives one direction, projection share 1 and the same s(t) in every
+     block; a centre-only generator gives centre share 1; reports written
+     (also with NaN shares); a dwconv-only model has only the dwconv site.
   I. set_can_freeze (evaluate.py --can_freeze): "all" at both sites == ONE
      flags-off model with static kernels K_l + E_t mean_y G; every other case
      ("class", "time", "all" at one site) == a per-sample loop over static
@@ -452,16 +457,84 @@ K3 = m_h.blocks[3].mixer.conv2d.weight[:, 0].double()
 assert abs(res["sites"]["dwconv"]["size"][3]["rms_ratio"]
            - math.sqrt(res["sites"]["dwconv"]["energy"]) / K3.norm().item()) < 1e-12
 
+# The time component T(t) = mean_y dK(t, .) - m, against M_l = K_l + m: naive recomputation.
+statics_h = {"dwconv": [b.mixer.conv2d.weight[:, 0].double().flatten() for b in m_h.blocks],
+             "sasf_d2": [b.mixer.state_fusion.kernels[1][:, 0].double().flatten() for b in m_h.blocks],
+             "sasf": [torch.stack([k[:, 0] for k in b.mixer.state_fusion.kernels]).double().flatten()
+                      for b in m_h.blocks]}
+for site, G in grids.items():
+    mean = (w3 * G).sum(0).mean(0)
+    Tn = G.mean(1) - mean                                   # (T, P)
+    tm = res["sites"][site]["time"]
+    e_t = (ws * Tn.pow(2).sum(-1)).sum().item()
+    assert abs(tm["energy"] - e_t) < 1e-12 * e_t
+    assert abs(tm["energy"] - res["sites"][site]["shares"]["time"] * res["sites"][site]["energy"]) < 1e-10 * e_t
+    sv = torch.tensor(tm["rank"]["sv"], dtype=torch.float64)
+    assert abs(sv.pow(2).sum().item() - e_t) < 1e-10 * e_t                  # SVD holds the time energy
+    assert abs(sum(tm["rank"]["frac"]) - 1) < 1e-12 and 1 <= tm["rank"]["n90"] <= tm["rank"]["n99"]
+    cum = torch.tensor(tm["rank"]["frac"]).cumsum(0)
+    assert cum[tm["rank"]["n90"] - 1] >= 0.9 - 1e-12 and (tm["rank"]["n90"] == 1 or cum[tm["rank"]["n90"] - 2] < 0.9)
+    T3 = Tn.view(NN, -1, 9)
+    for i in (0, NN // 2, NN - 1):
+        tt = T3[i].pow(2).sum().item()
+        assert abs(tm["centre"]["per_t"][i] - T3[i, :, 4].pow(2).sum().item() / tt) < 1e-12
+        for l in (0, 2):
+            M3 = (statics_h[site][l] + mean).view(-1, 9)
+            dots = [(T3[i, ch] @ M3[ch]).item() for ch in range(M3.shape[0])]       # per channel
+            p_ch = sum(d * d / float(M3[ch] @ M3[ch]) for ch, d in enumerate(dots))
+            a = sum(dots) / M3.pow(2).sum().item()
+            b = tm["blocks"][l]
+            assert abs(b["per_t"]["share_channel"][i] - p_ch / tt) < 1e-10
+            assert abs(b["per_t"]["scale"][i] - a) < 1e-10 * max(1, abs(a))
+            assert abs(b["per_t"]["share_one"][i] - a * a * M3.pow(2).sum().item() / tt) < 1e-10
+            assert abs(b["per_t"]["ratio"][i] - math.sqrt(tt) / M3.norm().item()) < 1e-12
+            assert b["per_t"]["share_one"][i] <= b["per_t"]["share_channel"][i] + 1e-12 <= 1 + 2e-12
+
+# Constructed case: dK = (v . SiLU(c)) u (rank-1 generator) and K_l = lam_l u, so
+# T(t) = s(t) u and M_l = (lam_l + mu) u: one direction, fully along M_l, with
+# a_l(t) (lam_l + mu) = s(t) the same in every block; centre-only u -> centre share 1.
+m_k = to64(build(dwconv_can=True).eval())
+P_dw = m_k.can_dwconv.weight.shape[0]
+torch.manual_seed(5)
+for centre_only in (False, True):
+    u = torch.randn(P_dw, dtype=torch.float64).view(-1, 9)
+    if centre_only:
+        u[:, [0, 1, 2, 3, 5, 6, 7, 8]] = 0
+    v = torch.randn(D, dtype=torch.float64)
+    lam = [20.0 * (l + 1) for l in range(len(m_k.blocks))]     # lam_l + mu kept away from 0
+    with torch.no_grad():
+        m_k.can_dwconv.weight.copy_(u.flatten()[:, None] * v[None])
+        for l, b in enumerate(m_k.blocks):
+            b.mixer.conv2d.weight.copy_(lam[l] * u.view_as(b.mixer.conv2d.weight[:, 0]).unsqueeze(1))
+    tk = measure(m_k, PM, PS, NN)["sites"]["dwconv"]["time"]
+    assert tk["rank"]["n90"] == tk["rank"]["n99"] == 1 and abs(tk["rank"]["frac"][0] - 1) < 1e-12
+    s_l = []
+    for b in tk["blocks"]:
+        assert abs(b["share_one"] - 1) < 1e-10 and abs(b["share_channel"] - 1) < 1e-10
+        s_l.append(torch.tensor(b["per_t"]["scale"], dtype=torch.float64) * b["M_norm"] / u.norm().item())   # = |lam_l+mu| a_l(t)
+    assert all(torch.allclose(s_l[0].abs(), s.abs(), rtol=1e-10, atol=1e-14) for s in s_l)
+    if centre_only:
+        assert abs(tk["centre"]["share"] - 1) < 1e-12
+        assert all(abs(c - 1) < 1e-12 for c in tk["centre"]["per_t"])
+
 with tempfile.TemporaryDirectory() as tmp:
     write_reports(res, tmp)
-    for f in ("can_energy.csv", "can_size.csv", "summary.json"):
+    write_reports(res0, tmp + "/zero")                      # NaN shares do not break the reports
+    for f in ("can_energy.csv", "can_size.csv", "can_time_rank.csv", "can_time_alpha.csv",
+              "can_time_centre.csv", "can_time_ratio.csv", "summary.json"):
         assert os.path.getsize(os.path.join(tmp, f)) > 0, f
+    import json as _json                                    # noqa: E402
+    assert "per_t" not in open(os.path.join(tmp, "summary.json"), encoding="utf-8").read()
+    _json.load(open(os.path.join(tmp, "summary.json"), encoding="utf-8"))
 assert set(measure(build(dwconv_can=True).eval(), PM, PS, 3)["sites"]) == {"dwconv"}
 sh = res["sites"]["sasf"]["shares"]
 print(f"H  measure_can: quadrature == the training t density (1e-9); zero generators -> "
       f"NaN shares; constant / time / class / interaction == a direct two-way decomposition "
       f"of the full grid, summing to 1 (e.g. sasf {sh['constant']:.3f} / {sh['time']:.3f} / "
-      f"{sh['class']:.3f} / {sh['interaction']:.3f}); size ratios; reports written")
+      f"{sh['class']:.3f} / {sh['interaction']:.3f}); size ratios; time component: SVD "
+      f"holds the time energy, projections / centre share / ||T||/||M|| == naive loops, "
+      f"rank-1 generator along K_l -> 1 direction, share 1, same s(t) in every block; "
+      f"centre-only -> centre share 1; reports written")
 
 
 # ═══ I. --can_freeze: all / class / time on the same weights ══════════════════

@@ -406,6 +406,7 @@ byte-identical to the previous model:
 - G(c) runs once per forward, with the same dK in every block;
 - the parameter counts, the fp32 CAN convs under bf16 autocast, the guards and both builders;
 - the diagnostic: the quadrature integrates the training density, and the energy shares match a direct two-way decomposition of the full grid;
+- the time analyses against naive loops. Also, a rank-1 generator along `K_l` gives one direction and share 1, with the same s(t) in every block, and a centre-only generator gives centre share 1;
 - the freeze: `all` at both sites equals ONE flags-off model with `K_l + E_t mean_y G`, and every other case equals a per-sample loop of static models with the naive averages. Also `None` restores the normal output, the `all` table's energy equals the constant part, and stale weights are refused.
 
 `scripts/check_spatial_can_cuda.py` is the GPU check: kernel exactness, bf16 fwd+bwd, it/s and memory vs `jit-s2-spatial-nogate`, and fvcore ΔMACs.
@@ -414,7 +415,15 @@ byte-identical to the previous model:
 - per site, the two-way **energy decomposition** of dK(t, y): constant `m`, time `mean_y dK − m`, class `E_t dK − m` and interaction shares of `E_t mean_y ‖dK‖²`, summing to 1;
 - per block, the RMS `‖dK‖/‖K_l‖` and `‖m‖/‖K_l‖`.
 
-On the same nodes, `--can_freeze all` keeps exactly the constant part, `class` keeps constant + time, and `time` keeps constant + class. The script is self-contained. The notebook `notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-can.ipynb` runs it after eval, followed by the three `--can_freeze` FID evals.
+On the same nodes, `--can_freeze all` keeps exactly the constant part, `class` keeps constant + time, and `time` keeps constant + class.
+
+It also analyses the **time component** `T(t) = mean_y dK(t, ·) − m` per site and SASF dilation, against `M_l = K_l + m` (the `all` kernel), one CSV each:
+- `can_time_rank.csv`: the singular values of `sqrt(w_t) T(t)` over the nodes, with their energy fractions and the directions reaching 90 / 99 %;
+- `can_time_alpha.csv`: per block and t, the share of `‖T‖²` along `M_l`, both per channel (9 taps) and with one signed scale `a_l(t) = ⟨T, M_l⟩/‖M_l‖²` (a time-dependent alpha);
+- `can_time_centre.csv`: the centre-tap vs ring share of `‖T(t)‖²`;
+- `can_time_ratio.csv`: `‖T(t)‖/‖M_l‖`.
+
+Means over t are ratios of `E_t` energies. The script is self-contained. `evaluate.py --grid N` (default 64) saves `grid.png`: every (n_samples/N)-th sample. The sampler is deterministic given its starting noise, so two evals with the same seed, batch size and n_samples (plain vs `--can_freeze`) compare image for image. The notebook `notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-can.ipynb` runs it after eval, followed by the three `--can_freeze` FID evals.
 
 ## JiT-S2-VMamba + SASF (`model: vmamba_sasf`)
 

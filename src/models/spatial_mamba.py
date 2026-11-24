@@ -79,6 +79,19 @@ AUX_TOKEN_MODES = ("none", "swap", "noswap")   # SF-Mamba aux tokens (+ no-swap 
 # DWConv and the SASF kernels -- so dK = G(c) is the same in every block and
 # each block keeps its own static K_l.
 
+CAN_FREEZE_MODES = ("all", "class", "time")
+
+
+def logit_normal_nodes(P_mean, P_std, n=64):
+    """Quadrature for E[f(t)] under the training density t = sigmoid(z),
+    z ~ N(P_mean, P_std) (src/train.py::Denoiser.sample_t): Gauss-Hermite in z.
+    Returns (t, w), float64 tensors of n nodes, w summing to 1."""
+    import numpy as np
+    x, w = np.polynomial.hermite_e.hermegauss(int(n))
+    t = 1.0 / (1.0 + np.exp(-(float(P_mean) + float(P_std) * x)))
+    return torch.from_numpy(t), torch.from_numpy(w / w.sum())
+
+
 class CANGenerator(nn.Module):
     """dK = W SiLU(c), reshaped to out_shape per sample. No bias, W zero-init.
 
@@ -798,6 +811,7 @@ class JiTSpatialMamba(nn.Module):
         if self.sasf_can:
             self.can_sasf = CANGenerator(hidden_size, (len(sasf_dilations), d_inner, 3, 3))
         self.can_zero = {"dwconv": False, "sasf": False}
+        self.can_freeze = None          # eval-only: see set_can_freeze
         self.initialize_weights()
         if norm == "derf":
             convert_rmsnorm_to_derf(self, derf_alpha_init)
@@ -860,14 +874,99 @@ class JiTSpatialMamba(nn.Module):
         """Eval ablation: drop dK at a site (static path) on the same weights."""
         assert not dwconv or self.dwconv_can, "dwconv_can is off in this model"
         assert not sasf or self.sasf_can, "sasf_can is off in this model"
+        assert self.can_freeze is None or not (dwconv or sasf), \
+            "set_can_zero and set_can_freeze are exclusive"
         self.can_zero = {"dwconv": bool(dwconv), "sasf": bool(sasf)}
 
-    def can_deltas(self, c):
+    def _can_gen(self, site):
+        return self.can_dwconv if site == "dwconv" else self.can_sasf
+
+    def _can_freeze_versions(self):
+        """In-place version counters of every weight the frozen tables read."""
+        ps = [*self.t_embedder.parameters(), *self.y_embedder.parameters(),
+              *(self._can_gen(s).weight for s in self.can_freeze["sites"])]
+        return tuple(p._version for p in ps)
+
+    @torch.no_grad()
+    def set_can_freeze(self, mode=None, sites=("dwconv", "sasf"), P_mean=None,
+                       P_std=None, n_nodes=64):
+        """Eval ablation: replace dK at `sites` by an average of G(c(t, y)) on the
+        same weights. mode None restores the normal path.
+
+          "all"   dK := E_t mean_y G(c(t, y)), one fixed kernel per site
+          "class" dK(t, y) := mean_y' G(c(t, y')) at the sample's own t
+                  (computed per forward, for each distinct t in the batch)
+          "time"  dK(t, y) := E_t' G(c(t', y)) for the sample's own y (the
+                  null class keeps its own time-average)
+
+        E_t is the training density t = sigmoid(N(P_mean, P_std)) by
+        Gauss-Hermite quadrature (logit_normal_nodes, n_nodes); mean_y is over
+        the num_classes real classes, null excluded. The "all" / "time" tables
+        are built from the CURRENT weights, so call this after an EMA swap
+        (Denoiser.swap_ema), not before: a forward on weights changed in place
+        since then raises.
+        """
+        if mode is None:
+            self.can_freeze = None
+            return
+        assert mode in CAN_FREEZE_MODES, "Unknown CAN freeze mode %r (use %s)" % (
+            mode, " | ".join(CAN_FREEZE_MODES))
+        sites = tuple(dict.fromkeys(sites))
+        assert sites and all(s in ("dwconv", "sasf") for s in sites), sites
+        for s in sites:
+            assert self.dwconv_can if s == "dwconv" else self.sasf_can, \
+                "%s_can is off in this model" % s
+        assert not any(self.can_zero.values()), "set_can_zero and set_can_freeze are exclusive"
+        tables = {}
+        if mode in ("all", "time"):
+            assert P_mean is not None and P_std is not None, \
+                "freeze %r averages over t: pass P_mean, P_std" % mode
+            dev = self.pos_embed.device
+            ts, ws = logit_normal_nodes(P_mean, P_std, n_nodes)
+            nc = self.num_classes
+            y_emb = self.y_embedder(torch.arange(nc + 1, device=dev))         # incl. null
+            for s in sites:
+                gen, acc, dtype = self._can_gen(s), 0.0, None
+                for t_i, w_i in zip(ts.tolist(), ws.tolist()):
+                    t_vec = torch.full((nc + 1,), t_i, device=dev)
+                    g = gen(self.t_embedder(t_vec) + y_emb)               # (nc + 1, ...)
+                    dtype = g.dtype
+                    acc = acc + w_i * g.double()
+                tables[s] = (acc if mode == "time" else acc[:nc].mean(0)).to(dtype)
+        self.can_freeze = {"mode": mode, "sites": sites, "tables": tables,
+                           "n_nodes": int(n_nodes)}
+        self.can_freeze["versions"] = self._can_freeze_versions()
+
+    def _frozen_delta(self, site, c, t, y):
+        fz = self.can_freeze
+        assert fz["versions"] == self._can_freeze_versions(), (
+            "CAN freeze tables were built from other weights (EMA swapped after "
+            "set_can_freeze?); call set_can_freeze again")
+        if fz["mode"] == "all":
+            tab = fz["tables"][site]
+            return tab.unsqueeze(0).expand(c.shape[0], *tab.shape)
+        if fz["mode"] == "time":
+            return fz["tables"][site][y]
+        # "class": the mean over the real classes at each distinct t
+        gen, nc = self._can_gen(site), self.num_classes
+        y_emb = self.y_embedder(torch.arange(nc, device=c.device))
+        t_u, inv = torch.unique(t, return_inverse=True)
+        rows = [gen(self.t_embedder(tu.expand(nc)) + y_emb).mean(0) for tu in t_u]
+        return torch.stack(rows)[inv]
+
+    def can_deltas(self, c, t=None, y=None):
         """(dk_dw, dk_sasf) for conditioning vector c, None where a site is off
-        or zeroed; None when both are. Called once per forward."""
-        dk_dw = self.can_dwconv(c) if self.dwconv_can and not self.can_zero["dwconv"] else None
-        dk_sasf = self.can_sasf(c) if self.sasf_can and not self.can_zero["sasf"] else None
-        return None if dk_dw is None and dk_sasf is None else (dk_dw, dk_sasf)
+        or zeroed; None when both are. Called once per forward. t, y are only
+        read by a frozen site (set_can_freeze)."""
+        out = []
+        for site, on in (("dwconv", self.dwconv_can), ("sasf", self.sasf_can)):
+            if not on or self.can_zero[site]:
+                out.append(None)
+            elif self.can_freeze is not None and site in self.can_freeze["sites"]:
+                out.append(self._frozen_delta(site, c, t, y))
+            else:
+                out.append(self._can_gen(site)(c))
+        return None if out[0] is None and out[1] is None else tuple(out)
 
     def unpatchify(self, x):
         p = self.patch_size
@@ -882,7 +981,7 @@ class JiTSpatialMamba(nn.Module):
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y)
         c = t_emb + y_emb
-        can = self.can_deltas(c)        # CAN kernel deltas, once for all blocks
+        can = self.can_deltas(c, t, y)  # CAN kernel deltas, once for all blocks
 
         x = self.x_embedder(x)
         x = x + self.pos_embed

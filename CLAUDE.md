@@ -385,7 +385,15 @@ byte-identical to the previous model:
 - **Per-sample conv.** `can_dwconv` computes the kernel sum and a grouped conv over B·C channels (SASF replicate-pads first, one call per dilation). It runs in at least fp32 with autocast off: the input is cast up and the output cast back to the input's dtype.
 - **Zero init.** The generators draw no random numbers, so every other weight equals the flags-off model's at the same seed, and a zero-init model computes the flags-off function.
 - **Guards.** Asserted off with class / aux tokens, `d_state > 1`, `feature_rope`, `ssm_norm`, `norm: derf` and conv FFNs.
-- **Eval switch.** `set_can_zero(dwconv=, sasf=)` drops a site's dK on the same weights, and that site then runs the static path exactly. From the command line: `evaluate.py --can_zero dwconv sasf`.
+- **Eval switches** (same checkpoint, generation only, mutually exclusive):
+  - `set_can_zero(dwconv=, sasf=)` / `evaluate.py --can_zero dwconv sasf` drops a site's dK, and that site then runs the static path exactly. The trained dK is mostly a large *shared* kernel, so zeroing it is not a valid test of the conditioning.
+  - `set_can_freeze(mode, sites, P_mean, P_std)` / `evaluate.py --can_freeze all|class|time [--can_freeze_sites dwconv sasf]` replaces dK by an average of G(c(t, y)):
+    - `all`: `E_t mean_y G`, one fixed kernel per site;
+    - `class`: `mean_y' G(c(t, y'))` at the sample's own t, computed per forward for each distinct t;
+    - `time`: `E_t' G(c(t', y))` for the sample's own y, the null class keeping its own average.
+  - `E_t` is the training density t = sigmoid(N(P_mean, P_std)) from the config's `diffusion`, by 64-node Gauss–Hermite quadrature (`logit_normal_nodes`). `mean_y` is over the real classes, null excluded.
+  - The `all` / `time` tables read the weights when the freeze is set, so `evaluate.py` sets it **inside** `swap_ema`. A forward after any in-place weight change refuses to run (`_version` counters).
+  - Each ablation writes to its own default out dir (`eval_canzero_*`, `eval_canfreeze_<mode>_<sites>`), and `results` records it.
 
 | Tiny-IN config under `configs/tiny_imagenet/` | params | MACs |
 |---|---|---|
@@ -396,11 +404,17 @@ byte-identical to the previous model:
 - the batched mixer equals a per-sample loop of static copies, and the whole model equals a loop over static models with `K_l + G(c_b)` (both float64);
 - a zero-init model equals the flags-off model, and `set_can_zero` equals the static path exactly;
 - G(c) runs once per forward, with the same dK in every block;
-- the parameter counts, the fp32 CAN convs under bf16 autocast, the guards, the diagnostic and both builders.
+- the parameter counts, the fp32 CAN convs under bf16 autocast, the guards and both builders;
+- the diagnostic: the quadrature integrates the training density, and the energy shares match a direct two-way decomposition of the full grid;
+- the freeze: `all` at both sites equals ONE flags-off model with `K_l + E_t mean_y G`, and every other case equals a per-sample loop of static models with the naive averages. Also `None` restores the normal output, the `all` table's energy equals the constant part, and stale weights are refused.
 
 `scripts/check_spatial_can_cuda.py` is the GPU check: kernel exactness, bf16 fwd+bwd, it/s and memory vs `jit-s2-spatial-nogate`, and fvcore ΔMACs.
 
-`scripts/measure_can.py` is the diagnostic. Per block and site it reports `‖dK‖/‖K_l‖` over t and class. Per site it also reports the class fraction `‖dK(t,y) − mean_y dK(t,·)‖/‖dK‖` and the time fraction (the same over t). It is self-contained, and the notebook `notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-can.ipynb` runs it after eval.
+`scripts/measure_can.py` is the diagnostic, run on the same quadrature times the real classes (null excluded):
+- per site, the two-way **energy decomposition** of dK(t, y): constant `m`, time `mean_y dK − m`, class `E_t dK − m` and interaction shares of `E_t mean_y ‖dK‖²`, summing to 1;
+- per block, the RMS `‖dK‖/‖K_l‖` and `‖m‖/‖K_l‖`.
+
+On the same nodes, `--can_freeze all` keeps exactly the constant part, `class` keeps constant + time, and `time` keeps constant + class. The script is self-contained. The notebook `notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-can.ipynb` runs it after eval, followed by the three `--can_freeze` FID evals.
 
 ## JiT-S2-VMamba + SASF (`model: vmamba_sasf`)
 
@@ -568,9 +582,9 @@ model and prove it in a CPU test under `tests/` (see
 `build_model` is duplicated in `scripts/run_experiment.py` and
 `scripts/evaluate.py`. These have drifted apart before — **update both** whenever
 a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf`, `vmamba2` and `vmamba_global` alike), or evaluation
-will silently build a different model than training did. `evaluate.py --can_zero
-dwconv|sasf` (CAN eval ablation, applied after the checkpoint loads) has no
-training counterpart. `scripts/profile_model.py` passes only `feature_rope`, `a_tie` and `bc_rope` through for vmamba and no conditioning flags
+will silently build a different model than training did. `evaluate.py --can_zero`
+and `--can_freeze` (CAN eval ablations; `--can_freeze` is set inside the EMA swap)
+have no training counterpart. `scripts/profile_model.py` passes only `feature_rope`, `a_tie` and `bc_rope` through for vmamba and no conditioning flags
 at all, and does not build `spatial_mamba` or `vmamba_global`; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.
 

@@ -265,7 +265,18 @@ def main():
                         help="spatial_mamba with dwconv_can / sasf_can: drop the "
                              "conditional kernel delta at these sites (static "
                              "kernels only) on the same checkpoint -- eval ablation.")
+    parser.add_argument("--can_freeze", default=None, choices=["all", "class", "time"],
+                        help="spatial_mamba with dwconv_can / sasf_can: replace dK at "
+                             "--can_freeze_sites by an average of G(c(t, y)) on the same "
+                             "checkpoint -- all: over t (training density) and the real "
+                             "classes; class: over the real classes at the sample's t; "
+                             "time: over t for the sample's class. Eval ablation.")
+    parser.add_argument("--can_freeze_sites", nargs="+", default=["dwconv", "sasf"],
+                        choices=["dwconv", "sasf"],
+                        help="Sites --can_freeze applies to (default: both).")
     args = parser.parse_args()
+    assert not (args.can_zero and args.can_freeze), "--can_zero and --can_freeze are exclusive"
+    args.can_freeze_sites = sorted(set(args.can_freeze_sites))
 
     # ─── BUG #9 FIX: deterministic generation ──────────────────────────────
     torch.manual_seed(args.seed)
@@ -293,7 +304,12 @@ def main():
     if args.n_samples is None:
         args.n_samples = s_cfg.get("n_samples") or (50000 if jit_fid else 10000)
 
-    out_dir = args.out_dir or os.path.join(os.path.dirname(args.checkpoint), "eval")
+    default_eval = "eval"                       # ablations never overwrite the plain eval
+    if args.can_zero:
+        default_eval += "_canzero_" + "_".join(sorted(args.can_zero))
+    if args.can_freeze:
+        default_eval += f"_canfreeze_{args.can_freeze}_" + "_".join(args.can_freeze_sites)
+    out_dir = args.out_dir or os.path.join(os.path.dirname(args.checkpoint), default_eval)
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"\n{'='*60}")
@@ -309,6 +325,10 @@ def main():
     print(f"  Seed        : {args.seed}")
     if args.can_zero:
         print(f"  CAN zeroed  : {', '.join(args.can_zero)} (static kernels only)")
+    if args.can_freeze:
+        print(f"  CAN frozen  : {args.can_freeze} at {', '.join(args.can_freeze_sites)} "
+              f"(dK averaged over {'t and class' if args.can_freeze == 'all' else args.can_freeze}"
+              f"; generation only)")
     print(f"  Device      : {device}")
     print(f"{'='*60}\n")
 
@@ -335,7 +355,11 @@ def main():
         assert hasattr(net, "set_can_zero"), "--can_zero needs a spatial_mamba CAN model"
         net.set_can_zero(dwconv="dwconv" in args.can_zero, sasf="sasf" in args.can_zero)
 
+    if args.can_freeze:
+        assert hasattr(net, "set_can_freeze"), "--can_freeze needs a spatial_mamba CAN model"
     results = {"can_zero": sorted(args.can_zero)} if args.can_zero else {}
+    if args.can_freeze:   # applied inside the EMA swap below (tables read the weights)
+        results["can_freeze"] = {"mode": args.can_freeze, "sites": args.can_freeze_sites}
 
     # ── 1. Complexity (MACs, params, throughput) ──────────────────────────────
     # ─── BUG #20 FIX: use src/flops_counter.py instead of thop. ─────────────
@@ -404,6 +428,10 @@ def main():
     denoiser.eval()
     count = 0
     with torch.no_grad(), denoiser.swap_ema(args.ema):
+        if args.can_freeze:   # after the swap: the averages read the EMA weights
+            net.set_can_freeze(args.can_freeze, sites=args.can_freeze_sites,
+                               P_mean=cfg["diffusion"]["P_mean"],
+                               P_std=cfg["diffusion"]["P_std"])
         pbar = tqdm(total=args.n_samples, desc="Generating")
         while count < args.n_samples:
             bs = min(args.batch_size, args.n_samples - count)

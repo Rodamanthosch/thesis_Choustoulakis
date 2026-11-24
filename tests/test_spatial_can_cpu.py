@@ -34,11 +34,19 @@ Checks:
      has the static conv's dtype and the SASF output its input's dtype.
   G. guards: tokens, aux tokens, d_state > 1, feature_rope, ssm_norm, Derf,
      conv FFNs; set_can_zero on a site that is off.
-  H. scripts/measure_can.py: zero generators -> every ratio 0, fractions NaN;
-     perturbed -> ratios and fractions finite and > 0, one (t, class, block)
-     entry of each quantity == a direct recomputation; the reports are written
-     and a dwconv-only model has only the dwconv site.
-  I. wiring: the config builds IDENTICAL models through both build_model
+  H. scripts/measure_can.py: the Gauss-Hermite nodes integrate the training
+     t density (trapezoid on z, 1e-9); zero generators -> NaN shares; the
+     constant / time / class / interaction energy shares == a direct two-way
+     decomposition of the full (t, class) grid and sum to 1; size ratios;
+     reports written; a dwconv-only model has only the dwconv site.
+  I. set_can_freeze (evaluate.py --can_freeze): "all" at both sites == ONE
+     flags-off model with static kernels K_l + E_t mean_y G; every other case
+     ("class", "time", "all" at one site) == a per-sample loop over static
+     models with the naive averages (repeated t, null class, either site alone
+     or both); None restores the normal output exactly; the "all" table's
+     energy == the constant part; weights changed after the call are refused;
+     guards.
+  J. wiring: the config builds IDENTICAL models through both build_model
      copies, 34,994,532 params = jit-s2-spatial-nogate + 5,308,416 (needs
      pyyaml).
 
@@ -387,62 +395,184 @@ print("G  guards: tokens, aux tokens, d_state > 1, feature_rope, ssm_norm, Derf,
       "set_can_zero on an off site")
 
 
-# ═══ H. the diagnostic script ════════════════════════════════════════════════
+# ═══ H. the diagnostic: energy decomposition on the training t density ═══════
 import tempfile                                             # noqa: E402
-import numpy as np                                          # noqa: E402
+import math                                                 # noqa: E402
 from scripts.measure_can import measure, write_reports     # noqa: E402
+from src.models.spatial_mamba import logit_normal_nodes    # noqa: E402
 
-res0 = measure(build(**BOTH).eval(), t_steps=5)
+PM, PS, NN, NC = -0.8, 0.8, 8, KW["num_classes"]           # the configs' P_mean / P_std
+
+# The quadrature is the training density t = sigmoid(N(P_mean, P_std)).
+ts_q, ws_q = logit_normal_nodes(PM, PS, 64)
+z = torch.linspace(PM - 12 * PS, PM + 12 * PS, 400001, dtype=torch.float64)
+pdf = torch.exp(-0.5 * ((z - PM) / PS) ** 2) / (PS * math.sqrt(2 * math.pi))
+for f in (lambda t: t, lambda t: t ** 2, lambda t: torch.cos(7 * t)):
+    exact = torch.trapezoid(f(torch.sigmoid(z)) * pdf, z).item()
+    assert abs((ws_q * f(ts_q)).sum().item() - exact) < 1e-9, exact
+assert abs(ws_q.sum().item() - 1) < 1e-14 and ((ts_q > 0) & (ts_q < 1)).all()
+
+res0 = measure(build(**BOTH).eval(), PM, PS, NN)
 assert set(res0["sites"]) == {"dwconv", "sasf_d1", "sasf_d2", "sasf_d3", "sasf"}
 for a in res0["sites"].values():
-    assert (a["ratio"] == 0).all() and np.isnan(a["class_frac"]).all() and np.isnan(a["time_frac"]).all()
+    assert a["energy"] == 0 and all(math.isnan(v) for v in a["shares"].values())
 
-m = perturb(build(**BOTH), 0.05).eval()
+m_h = perturb(build(**BOTH), 0.05).eval()
 with torch.no_grad():
-    m.can_dwconv.weight.normal_(0, 0.05), m.can_sasf.weight.normal_(0, 0.05)
-to64(m)                          # float64 embedders: batched == one-by-one c
-res = measure(m, t_steps=5)
-for a in res["sites"].values():
-    for k in ("ratio", "class_frac", "time_frac"):
-        assert np.isfinite(a[k]).all() and (a[k] > 0).all(), k
+    m_h.can_dwconv.weight.normal_(0, 0.05), m_h.can_sasf.weight.normal_(0, 0.05)
+to64(m_h)
+res = measure(m_h, PM, PS, NN)
 
-ti, yi, li, NC = 2, 1, 3, KW["num_classes"]                 # one entry, recomputed directly
+ts, ws = logit_normal_nodes(PM, PS, NN)                     # the full grid, directly
 with torch.no_grad():
-    ts = torch.linspace(0, 1, 5)
-
-    def dk_at(t, y):
-        c = m.t_embedder(torch.tensor([float(t)])) + m.y_embedder(torch.tensor([y]))
-        return m.can_dwconv(c)[0], m.can_sasf(c)[0]
-
-    dw, sa = dk_at(ts[ti], yi)
-    K_dw = m.blocks[li].mixer.conv2d.weight[:, 0].double()
-    K_s2 = m.blocks[li].mixer.state_fusion.kernels[1][:, 0].double()
-    mean_y = torch.stack([dk_at(ts[ti], y)[0] for y in range(NC)]).mean(0)
-    mean_t = torch.stack([dk_at(t, yi)[1] for t in ts]).mean(0)
-    want = {("dwconv", "ratio"): (dw.norm() / K_dw.norm()).item(),
-            ("sasf_d2", "ratio"): (sa[1].norm() / K_s2.norm()).item(),
-            ("dwconv", "class_frac"): ((dw - mean_y).norm() / dw.norm()).item(),
-            ("sasf", "time_frac"): ((sa - mean_t).norm() / sa.norm()).item()}
-for (site, k), v in want.items():
-    got_v = res["sites"][site][k][li, ti, yi] if k == "ratio" else res["sites"][site][k][ti, yi]
-    assert abs(got_v - v) < 1e-10 * max(1.0, abs(v)), (site, k, got_v, v)
+    c_grid = torch.stack([m_h.t_embedder(torch.full((NC,), t)) + m_h.y_embedder(torch.arange(NC))
+                          for t in ts.tolist()])            # (T, NC, D)
+    g_dw = m_h.can_dwconv(c_grid.flatten(0, 1)).view(NN, NC, -1)
+    g_sa = m_h.can_sasf(c_grid.flatten(0, 1)).view(NN, NC, N_DIL, -1)
+grids = {"dwconv": g_dw, "sasf_d2": g_sa[:, :, 1], "sasf": g_sa.flatten(2)}
+w3 = ws[:, None, None]
+for site, G in grids.items():
+    mean = (w3 * G).sum(0).mean(0)                          # m
+    a_t = G.mean(1) - mean                                  # (T, P)
+    b_y = (w3 * G).sum(0) - mean                            # (NC, P)
+    r = G - mean - a_t[:, None] - b_y[None]
+    E = (ws[:, None] * G.pow(2).sum(-1)).sum(0).mean().item()
+    parts = {"constant": mean.pow(2).sum().item(),
+             "time": (ws * a_t.pow(2).sum(-1)).sum().item(),
+             "class": b_y.pow(2).sum(-1).mean().item(),
+             "interaction": (ws[:, None] * r.pow(2).sum(-1)).sum(0).mean().item()}
+    assert abs(sum(parts.values()) - E) < 1e-12 * E                         # orthogonal
+    got = res["sites"][site]
+    assert abs(got["energy"] - E) < 1e-12 * E, site
+    for k, v in parts.items():
+        assert abs(got["shares"][k] - v / E) < 1e-10, (site, k, got["shares"][k], v / E)
+    assert all(0 <= v <= 1 for v in got["shares"].values())
+    assert abs(sum(got["shares"].values()) - 1) < 1e-12
+K3 = m_h.blocks[3].mixer.conv2d.weight[:, 0].double()
+assert abs(res["sites"]["dwconv"]["size"][3]["rms_ratio"]
+           - math.sqrt(res["sites"]["dwconv"]["energy"]) / K3.norm().item()) < 1e-12
 
 with tempfile.TemporaryDirectory() as tmp:
-    summary = write_reports(res, tmp, NC)
-    for f in ("can_ratio.csv", "can_split.csv", "can_split_by_class.csv",
-              "can_diagnostic.npz", "summary.json"):
+    write_reports(res, tmp)
+    for f in ("can_energy.csv", "can_size.csv", "summary.json"):
         assert os.path.getsize(os.path.join(tmp, f)) > 0, f
-assert len(summary["sites"]["dwconv"]["ratio_mean_per_block"]) == KW["depth"]
-assert set(measure(build(dwconv_can=True).eval(), 3)["sites"]) == {"dwconv"}
-print("H  measure_can: zero generators -> ratios 0, fractions NaN; trained-like -> finite > 0; "
-      "ratio, class and time fractions == direct recomputation; reports written")
+assert set(measure(build(dwconv_can=True).eval(), PM, PS, 3)["sites"]) == {"dwconv"}
+sh = res["sites"]["sasf"]["shares"]
+print(f"H  measure_can: quadrature == the training t density (1e-9); zero generators -> "
+      f"NaN shares; constant / time / class / interaction == a direct two-way decomposition "
+      f"of the full grid, summing to 1 (e.g. sasf {sh['constant']:.3f} / {sh['time']:.3f} / "
+      f"{sh['class']:.3f} / {sh['interaction']:.3f}); size ratios; reports written")
 
 
-# ═══ I. both build_model copies agree on the config ═══════════════════════════
+# ═══ I. --can_freeze: all / class / time on the same weights ══════════════════
+def g_one(m, site, t, y):
+    """G(c(t, y)) for one (t, y), one row at a time (float64 model)."""
+    c = m.t_embedder(torch.tensor([float(t)])) + m.y_embedder(torch.tensor([int(y)]))
+    return (m.can_dwconv if site == "dwconv" else m.can_sasf)(c)[0]
+
+
+def naive_frozen(m, site, mode, t, y):
+    if mode == "all":
+        return sum(w * torch.stack([g_one(m, site, ti, yy) for yy in range(NC)]).mean(0)
+                   for ti, w in zip(ts.tolist(), ws.tolist()))
+    if mode == "class":
+        return torch.stack([g_one(m, site, t, yy) for yy in range(NC)]).mean(0)
+    return sum(w * g_one(m, site, ti, y) for ti, w in zip(ts.tolist(), ws.tolist()))
+
+
+def static_ref(src, dk_dw, dk_sasf):
+    """A flags-off model with src's weights and static kernels K_l + dK."""
+    ref = to64(build())
+    ref.load_state_dict(src.state_dict(), strict=False)
+    with torch.no_grad():
+        for blk in ref.blocks:
+            blk.mixer.conv2d.weight.add_(dk_dw.unsqueeze(1))
+            for j, k in enumerate(blk.mixer.state_fusion.kernels):
+                k.add_(dk_sasf[j].unsqueeze(1))
+    return ref.eval()
+
+
+m_f = to64(perturb(build(**BOTH), 0.05)).eval()
+t_f = torch.tensor([0.3, 0.7, 0.3], dtype=torch.float64)    # a repeated t (class mode)
+y_f = torch.tensor([1, 4, NC])                              # and the null class (time mode)
+with torch.no_grad():
+    o_plain = m_f(x64, t_f, y_f)
+worst, n_i = 0.0, 0
+for mode in ("all", "class", "time"):
+    for sites in (("dwconv", "sasf"), ("sasf",), ("dwconv",)):
+        m_f.set_can_freeze(mode, sites=sites, P_mean=PM, P_std=PS, n_nodes=NN)
+        with torch.no_grad():
+            got = m_f(x64, t_f, y_f)
+            if mode == "all" and len(sites) == 2:
+                # one fixed kernel per site: ONE flags-off model for the batch
+                want = static_ref(m_f, naive_frozen(m_f, "dwconv", "all", None, None),
+                                  naive_frozen(m_f, "sasf", "all", None, None))(x64, t_f, y_f)
+            else:                       # per sample (the unfrozen site reads G(c_b))
+                rows = []
+                for b in range(Bsz):
+                    tb, yb = t_f[b].item(), y_f[b].item()
+                    dks = {s: (naive_frozen(m_f, s, mode, tb, yb) if s in sites
+                               else g_one(m_f, s, tb, yb)) for s in ("dwconv", "sasf")}
+                    rows.append(static_ref(m_f, dks["dwconv"], dks["sasf"])(
+                        x64[b:b + 1], t_f[b:b + 1], y_f[b:b + 1]))
+                want = torch.cat(rows)
+        err = (got - want).abs().max().item()
+        assert err < 1e-12, (mode, sites, err)
+        assert (got - o_plain).abs().max() > 1e-6, (mode, sites)     # it does change dK
+        worst, n_i = max(worst, err), n_i + 1
+m_f.set_can_freeze(None)
+with torch.no_grad():
+    assert torch.equal(m_f(x64, t_f, y_f), o_plain)
+
+# the "all" table is the decomposition's constant part, on the same nodes
+m_h.set_can_freeze("all", P_mean=PM, P_std=PS, n_nodes=NN)
+for s in ("dwconv", "sasf"):
+    e_c = res["sites"][s]["shares"]["constant"] * res["sites"][s]["energy"]
+    assert abs(m_h.can_freeze["tables"][s].pow(2).sum().item() - e_c) < 1e-10 * e_c, s
+m_h.set_can_freeze(None)
+
+# weights changed after set_can_freeze (e.g. an EMA swap) -> refuse to run
+m_f.set_can_freeze("time", P_mean=PM, P_std=PS, n_nodes=NN)
+with torch.no_grad():
+    m_f.can_sasf.weight.add_(0.0)
+try:
+    with torch.no_grad():
+        m_f(x64, t_f, y_f)
+    raise RuntimeError("stale freeze tables were used")
+except AssertionError:
+    pass
+m_f.set_can_freeze(None)
+
+
+def refused(fn):
+    try:
+        fn()
+    except AssertionError:
+        return True
+    return False
+
+
+assert refused(lambda: m_f.set_can_freeze("both", P_mean=PM, P_std=PS))
+assert refused(lambda: m_f.set_can_freeze("all"))                         # no density
+assert refused(lambda: m_f.set_can_freeze("time", P_std=PS))
+assert refused(lambda: build(dwconv_can=True).set_can_freeze("class", sites=("sasf",)))
+m_f.set_can_zero(dwconv=True)
+assert refused(lambda: m_f.set_can_freeze("class"))
+m_f.set_can_zero()
+m_f.set_can_freeze("class")                                               # no density needed
+assert refused(lambda: m_f.set_can_zero(sasf=True))
+m_f.set_can_freeze(None)
+print(f"I  can_freeze all / class / time x (both, sasf, dwconv) == static models with the "
+      f"naive averages ({n_i} configs, max|diff| = {worst:.1e}; all == ONE flags-off model "
+      f"with K_l + mean dK); off == normal exactly; 'all' table == the constant part; "
+      f"stale weights refused; guards")
+
+
+# ═══ J. both build_model copies agree on the config ═══════════════════════════
 try:
     import yaml                                             # noqa: E402
 except ImportError as e:                                    # pragma: no cover
-    print(f"I  SKIPPED (pyyaml not importable here: {e})")
+    print(f"J  SKIPPED (pyyaml not importable here: {e})")
     print("ALL CHECKS PASSED")
     sys.exit(0)
 
@@ -478,7 +608,7 @@ assert n_base == 29_686_116, n_base
 assert n_params(mt) == 34_994_532 == n_base + 9 * 384 * 384 + 27 * 384 * 384, n_params(mt)
 sb = mb.state_dict()
 assert all(torch.equal(sb[k], st[k]) for k in sb)               # same init at the same seed
-print(f"I  {name}: train == eval build_model, {n_params(mt):,} params "
+print(f"J  {name}: train == eval build_model, {n_params(mt):,} params "
       f"(no-gate {n_base:,} + 5,308,416); every baseline weight identical at seed 0")
 
 print("ALL CHECKS PASSED")

@@ -254,6 +254,44 @@ transcriptions, scale invariance in the normalised x_proj rows, the gains
 and the wiring; `scripts/check_ssm_norm_cuda.py --pair vmamba|spatial` is the
 GPU check (kernel vs `selective_scan_ref`, bf16 fwd+bwd, it/s, peak memory).
 
+## 2-path SS2D (`scan_paths`) and aux tokens (`vmamba`)
+
+`scan_paths: [0, 2]` keeps SS2D's two **forward** paths: row-major and column-major, both from cell (0, 0) to (H−1, W−1). The reversed paths 1 / 3 are dropped together with their per-direction parameters: `x_proj`, `dt_proj`, `A_logs` and `Ds` stay K-stacked, with slot k = `scan_paths[k]`. On top of it, `aux_tokens` is SF-Mamba's auxiliary patch swapping, with the same semantics as the `spatial_mamba` version below. That setting is what SF-Mamba targets: with no reversed scan, no cell reads the cells after it.
+
+Both are modifiers, not arms (not in `n_arms`).
+- **Defaults.** `scan_paths: [0, 1, 2, 3]` calls `cross_scan` / `cross_merge` verbatim, and `aux_tokens: none` is off. Both are byte-identical to the previous model.
+- **Guards.** `aux_tokens` requires `scan_paths: [0, 2]`. Both `[0, 2]` and the tokens are asserted off with every arm and modifier: `in_context_*`, `state_init`, `ssc`, `adaln_cond` ≠ full, `ssc_z_mlp`, `ssm_norm`, `feature_rope`, `a_tie`, `bc_rope`, conv FFNs and `norm: derf`.
+
+| `model:` key | values | meaning |
+|---|---|---|
+| `scan_paths` | `[0, 1, 2, 3]` (default) \| `[0, 2]` | needs `K` = `len(scan_paths)`, so the 2-path configs set `K: 2`; `cross_scan_paths` / `cross_merge_paths` |
+| `aux_tokens` | `none` (default) \| `swap` \| `noswap` | at `aux_tokens_start`, `[head, tail]` = the grid mean join as `[head, tail, grid]`; `swap` exchanges them after blocks start … depth−2; stripped before `final_layer` |
+| `aux_tokens_start` | default 0 (config: 4) | |
+
+In the mixer (`SS2D(aux_tokens=True)`, exactly 2 extra rows):
+- the tokens' input is `in_proj` → DWConv **centre tap + bias** → SiLU;
+- in both paths the head is scanned before cell (0, 0) and the tail after the last cell. So the tail reads every cell and is read by none, and the head is read by every cell;
+- the token outputs are summed over the two paths (D skip once per path, as for the prefix), and the grid goes through `cross_merge_paths`.
+
+adaLN-Zero and the token-wise SwiGLU are unchanged. Per path and block: (dt_rank + 2N)·d + d·dt_rank + 2d + d·N = 37,632 params.
+
+| Tiny-IN config under `configs/tiny_imagenet/` | params | GMACs (expected) |
+|---|---|---|
+| `jit-s2-vmamba-2path` (control, no notebook yet) | 30,128,448 (−903,168) | ≈ 1.290 |
+| `jit-s2-vmamba-2path-auxswap` (swap from block 4: 7 swaps) | 30,128,448 (+0) | ≈ 1.317 |
+
+The tokens have 0 params, so the control and the swap / no-swap models load into each other strictly. The notebook `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-2path-auxswap.ipynb` resumes only from paths containing `2path-auxswap`; a control notebook needs a tag that is not a substring of it (e.g. `2path-plain`).
+
+`tests/test_vmamba_2path_auxswap_cpu.py` proves:
+- the defaults are bit-identical to commit `fe955ad` (pinned; `SCAN_PATHS_REFERENCE=<rev>` overrides) for 17 JiTVMamba arm / modifier builds, `vmamba_sasf` and `vmamba_global`;
+- the helpers against `cross_scan` / `cross_merge`;
+- the `[0, 2]` mixer, with and without tokens, against a naive float64 transcription on a rectangular grid;
+- causality on the mixer and on a whole `JiTBlock`;
+- swap / noswap against hand-written block loops;
+- the param counts, strict loading, the guards and the three builders.
+
+`scripts/check_vmamba_2path_cuda.py --config 2path|auxswap` is the GPU check: kernel vs `selective_scan_ref`, bf16 fwd+bwd, it/s and memory vs the 4-path baseline, and fvcore GMACs of all three configs, each within 2 % of the expectation.
+
 ## JiT-S2-Spatial-Mamba (`model: spatial_mamba`)
 
 `src/models/spatial_mamba.py` is a **separate model** (`vmamba.py` untouched):
@@ -320,7 +358,7 @@ causal, and recomputes the distance figures from the module's scan order;
 `scripts/check_spatial_incontext_cuda.py` is the GPU check (exactness, bf16
 fwd+bwd, it/s and peak memory vs the no-gate run).
 
-## Auxiliary tokens (`aux_tokens`, `spatial_mamba` only)
+## Auxiliary tokens (`aux_tokens`, `spatial_mamba`; for `vmamba` see the 2-path section)
 
 SF-Mamba's auxiliary patch swapping (Yoshimura et al., ICML 2026, arXiv
 2603.16423; official `sony/SF-Mamba` `HybridStage.forward`) on the one
@@ -593,7 +631,7 @@ model and prove it in a CPU test under `tests/` (see
 a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf`, `vmamba2` and `vmamba_global` alike), or evaluation
 will silently build a different model than training did. `evaluate.py --can_zero`
 and `--can_freeze` (CAN eval ablations; `--can_freeze` is set inside the EMA swap)
-have no training counterpart. `scripts/profile_model.py` passes only `feature_rope`, `a_tie` and `bc_rope` through for vmamba and no conditioning flags
+have no training counterpart. `scripts/profile_model.py` passes only `feature_rope`, `a_tie`, `bc_rope` and `scan_paths` through for vmamba (not `aux_tokens`) and no conditioning flags
 at all, and does not build `spatial_mamba` or `vmamba_global`; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.
 

@@ -1,0 +1,80 @@
+# ============================================================
+# JiT-S2-VMamba (SS2D) on Tiny-ImageNet 64x64 -- 2-PATH SS2D + SF-MAMBA AUX SWAP
+# ------------------------------------------------------------
+# jit-s2-vmamba-2path.yaml (scan_paths [0, 2]: the two forward paths only)
+# plus SF-Mamba's auxiliary patch swapping (Yoshimura et al., ICML 2026,
+# arXiv 2603.16423): at block 4 two tokens, the mean of the grid tokens, join
+# as [head, tail, grid]; in both paths head is scanned before cell (0,0) and
+# tail after the last cell (in_proj -> DWConv centre tap + bias -> SiLU);
+# head <-> tail swapped after blocks 4..10 (7 swaps), stripped before the
+# final layer. The tail has read the whole grid, so after the swap that
+# summary is scanned first: future -> past flow without reversed scans.
+# 30,128,448 params (+0 vs the 2-path control), about 1.317 GMACs.
+# ============================================================
+
+experiment:
+  name: jit-s2-vmamba-tinyin-2path-auxswap
+  model: vmamba
+  dataset: imagenet
+  data_dir: ./data/tiny-imagenet-200
+  seed: 42
+
+model:
+  input_size: 64
+  patch_size: 8
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0                    # FFN width: h = int(mlp_ratio * D * 2/3) = 1024
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 16
+  d_conv: 3
+  expand: 1
+  K: 2                              # = len(scan_paths)
+  scan_paths: [0, 2]                # forward paths only (row-major, column-major)
+  aux_tokens: swap                  # none | swap | noswap (SF-Mamba aux tokens)
+  aux_tokens_start: 4               # block the tokens join at; swaps after 4..10
+  # -- conditioning arms: all OFF (adaLN-Zero baseline scaffold) --
+  in_context_len: 0                 # in-context prefix OFF
+  state_init: none                  # state-init OFF
+  ssc: none                         # SSC OFF
+  adaln_cond: full                  # adaLN-Zero on both branches (baseline)
+  # -- FFN variant (orthogonal to the arms) --
+  ffn: swiglu                  # swiglu | convglu | glumbconv
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-vmamba-2path-auxswap

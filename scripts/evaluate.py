@@ -119,6 +119,9 @@ def build_model(cfg):
             a_tie=m.get("a_tie", "none"),
             bc_rope=m.get("bc_rope", "none"),
             bc_rope_theta=m.get("bc_rope_theta", 10.0),
+            scan_paths=tuple(m.get("scan_paths", [0, 1, 2, 3])),
+            aux_tokens=m.get("aux_tokens", "none"),
+            aux_tokens_start=m.get("aux_tokens_start", 0),
         )
     elif arch == "spatial_mamba":
         from src.models.spatial_mamba import JiTSpatialMamba

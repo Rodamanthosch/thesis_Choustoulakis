@@ -67,6 +67,45 @@ def cross_merge(ys: torch.Tensor, H: int, W: int) -> torch.Tensor:
     return s1 + s2 + s3 + s4
 
 
+# ── Path subsets (scan_paths) ────────────────────────────────────────────────
+# SCAN_PATHS lists the allowed subsets of cross_scan's four paths. (0, 2) keeps
+# the two FORWARD scans, row-major and column-major, both from cell (0, 0) to
+# (H-1, W-1): the 2-path SS2D used with SF-Mamba's auxiliary tokens.
+SCAN_PATHS = ((0, 1, 2, 3), (0, 2))
+AUX_TOKEN_MODES = ("none", "swap", "noswap")
+
+
+def cross_scan_paths(x: torch.Tensor, paths) -> torch.Tensor:
+    """cross_scan restricted to `paths`: (B, C, H, W) -> (B, len(paths), C, HW).
+    The four paths are cross_scan itself (same call, bit for bit)."""
+    paths = tuple(paths)
+    if paths == (0, 1, 2, 3):
+        return cross_scan(x)
+    B, C, H, W = x.shape
+    L = H * W
+    out = []
+    for p in paths:
+        s = x.reshape(B, C, L) if p in (0, 1) else x.transpose(2, 3).reshape(B, C, L)
+        out.append(s.flip(-1) if p in (1, 3) else s)
+    return torch.stack(out, dim=1)
+
+
+def cross_merge_paths(ys: torch.Tensor, H: int, W: int, paths) -> torch.Tensor:
+    """cross_merge restricted to `paths`: un-permute each chosen path back to
+    row-major and sum them in path order. The four paths are cross_merge."""
+    paths = tuple(paths)
+    if paths == (0, 1, 2, 3):
+        return cross_merge(ys, H, W)
+    B, K, C, L = ys.shape
+    out = None
+    for k, p in enumerate(paths):
+        s = ys[:, k].flip(-1) if p in (1, 3) else ys[:, k]
+        if p in (2, 3):
+            s = s.reshape(B, C, W, H).transpose(2, 3).reshape(B, C, L)
+        out = s if out is None else out + s
+    return out
+
+
 # ── Diagonal in-context layout: tokens tied to grid cells ────────────────────
 # Token e is tied to cell (e*s, e*s), s = grid // n, and sits JUST BEFORE that
 # cell in canonical order. Unlike "prefix"/"row" (inserted after cross_scan, so
@@ -225,6 +264,8 @@ class SS2D(nn.Module):
         a_tie: str = "none",          # "none" | "pairs"  (A shared by state pairs (2m, 2m+1))
         bc_rope: str = "none",        # "none" | "2d_axial"  (rotate B and C; needs a_tie="pairs")
         bc_rope_theta: float = 10.0,
+        scan_paths=(0, 1, 2, 3),      # subset of cross_scan's paths (SCAN_PATHS); K == len
+        aux_tokens: bool = False,     # the 2 leading rows are SF-Mamba [head, tail] tokens
     ):
         super().__init__()
         self.d_model = d_model
@@ -233,6 +274,26 @@ class SS2D(nn.Module):
         self.d_inner = int(expand * d_model)
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(d_model / 16)
         self.K = K
+        # scan_paths: which of cross_scan's paths are scanned; the K-stacked
+        # per-direction parameters below exist for those paths only (k-th slot
+        # = scan_paths[k]). The 4-path default calls cross_scan / cross_merge
+        # verbatim, so it is byte-for-byte the previous module.
+        scan_paths = tuple(int(p) for p in scan_paths)
+        assert scan_paths in SCAN_PATHS, (
+            "scan_paths=%r is not supported (use %s)"
+            % (list(scan_paths), " | ".join(str(list(p)) for p in SCAN_PATHS)))
+        assert K == len(scan_paths), (
+            "K=%d must equal len(scan_paths)=%d (scan_paths=%r)"
+            % (K, len(scan_paths), list(scan_paths)))
+        self.scan_paths = scan_paths
+        # aux_tokens: SF-Mamba auxiliary tokens. When the input carries extra
+        # rows, they are exactly 2 ([head, tail]): head scanned before cell
+        # (0, 0) and tail after the last cell in every path; in_proj ->
+        # DWConv centre tap + bias -> SiLU. Only for the two forward paths.
+        self.aux_tokens = bool(aux_tokens)
+        assert not self.aux_tokens or scan_paths == (0, 2), (
+            "aux_tokens need scan_paths [0, 2] (forward-only scans); got %r"
+            % (list(scan_paths),))
 
         # Where the in-context condition tokens are placed in the scan (§3b).
         #   "prefix" → all at the head of every direction (DiM; the default and the
@@ -452,6 +513,15 @@ class SS2D(nn.Module):
           the K paths. Model token layout, persist & update and the strip are
           unchanged.
 
+        aux_tokens (scan_paths [0, 2], extra_len == 2; SF-Mamba):
+          The 2 leading rows are [head, tail]. Their input is in_proj -> DWConv
+          centre tap + bias -> SiLU; in both forward paths head is scanned
+          before cell (0, 0) and tail after the last cell, so the tail reads
+          the whole grid and nothing reads it, while every cell reads the head.
+          Returned as [head, tail, grid]: each token's outputs summed over the
+          two paths, the grid by cross_merge_paths. The swap between blocks is
+          the model's (JiTVMamba.forward).
+
         extra_len == 0 recovers the byte-for-byte baseline path, and
         in_context_layout == "prefix" is byte-for-byte the previous prefix path.
         """
@@ -479,7 +549,10 @@ class SS2D(nn.Module):
         if self.feature_rope != "none":
             z2d = apply_feature_rope(z2d, self.feature_rope, self.feature_rope_theta)
 
-        diagonal = extra_len > 0 and self.in_context_layout == "diagonal"
+        aux = extra_len > 0 and self.aux_tokens
+        assert not aux or extra_len == 2, (
+            "aux_tokens expect exactly 2 extra rows [head, tail]; got %d" % extra_len)
+        diagonal = extra_len > 0 and self.in_context_layout == "diagonal" and not aux
         if diagonal:
             # ── 3'. Diagonal: tokens permuted WITH the grid, one gather ──
             # joint = [tokens, grid row-major]; path k reads joint[idx[k]].
@@ -490,11 +563,23 @@ class SS2D(nn.Module):
                  z2d.reshape(B, d_inner, HW)], dim=-1)          # (B, d_inner, extra_len+HW)
             xs = joint[:, :, idx].transpose(1, 2).contiguous()  # (B, K, d_inner, extra_len+HW)
         else:
-            # ── 3. CrossScan: 4 directions over the pure H×W grid ────────
-            xs = cross_scan(z2d)                                # (B, K, d_inner, HW)
+            # ── 3. CrossScan: the scan_paths directions (4 = cross_scan) ──
+            xs = cross_scan_paths(z2d, self.scan_paths)         # (B, K, d_inner, HW)
+
+        # ── 3a. SF-Mamba aux tokens: head before cell (0, 0), tail after the
+        # last cell, in every (forward) path. Token input: in_proj -> DWConv
+        # centre tap + bias -> SiLU (no grid neighbours), as spatial_mamba's
+        # token_conv; shared by the paths, each path's x_proj gives its Δ/B/C.
+        if aux:
+            kc = self.d_conv // 2
+            tok = self.act(
+                z_extra.transpose(1, 2) * self.conv2d.weight[:, 0, kc, kc].unsqueeze(-1)
+                + self.conv2d.bias.unsqueeze(-1))               # (B, d_inner, 2)
+            tok = tok[:, None].expand(B, K, d_inner, 2).to(xs.dtype)
+            xs = torch.cat([tok[..., :1], xs, tok[..., 1:]], dim=-1)   # (B, K, d_inner, 1+HW+1)
 
         # ── 3b. Place the condition seed into every scan ──────────────
-        if extra_len > 0 and not diagonal:
+        if extra_len > 0 and not diagonal and not aux:
             # Same seed fed to all K directions; each direction's x_proj[k]
             # still gives it a distinct Δ/B/C.
             seed = z_extra.transpose(1, 2)[:, None]             # (B, 1, d_inner, extra_len)
@@ -683,6 +768,12 @@ class SS2D(nn.Module):
             out = ys[:, 0][..., inv[0]]
             for k in range(1, K):
                 out = out + ys[:, k][..., inv[k]]         # (B, d_inner, extra_len+HW)
+        elif aux:
+            # [head, tail, grid]: each token summed over the paths (its D skip
+            # once per path, as the prefix arm), the grid un-permuted + summed.
+            out = torch.cat(
+                [ys[..., :1].sum(dim=1), ys[..., -1:].sum(dim=1),
+                 cross_merge_paths(ys[..., 1:-1], H, W, self.scan_paths)], dim=-1)
         elif extra_len > 0:
             if self.in_context_layout == "prefix":
                 ys_extra = ys[:, :, :, :extra_len]        # (B, K, d_inner, extra_len)
@@ -692,11 +783,11 @@ class SS2D(nn.Module):
                 ys_r     = ys.view(B, K, d_inner, H, U + W)
                 ys_extra = ys_r[..., :U].reshape(B, K, d_inner, extra_len)
                 ys_grid  = ys_r[..., U:].reshape(B, K, d_inner, HW)
-            out_grid  = cross_merge(ys_grid, H, W)        # (B, d_inner, HW)
+            out_grid  = cross_merge_paths(ys_grid, H, W, self.scan_paths)   # (B, d_inner, HW)
             out_extra = ys_extra.sum(dim=1)               # (B, d_inner, extra_len)
             out = torch.cat([out_extra, out_grid], dim=-1)  # (B, d_inner, extra_len+HW)
         else:
-            out = cross_merge(ys, H, W)                   # (B, d_inner, HW)  [baseline]
+            out = cross_merge_paths(ys, H, W, self.scan_paths)   # (B, d_inner, HW)  [baseline: cross_merge]
 
         out = out.transpose(1, 2)                         # (B, L_in, d_inner)
 
@@ -724,7 +815,8 @@ class JiTBlock(nn.Module):
                  attn_drop=0.0, proj_drop=0.0, state_init="none", ssc="none",
                  in_context_layout="prefix", adaln_cond="full", ffn="swiglu",
                  ssm_norm="none", feature_rope="none", feature_rope_theta=10000.0,
-                 a_tie="none", bc_rope="none", bc_rope_theta=10.0):
+                 a_tie="none", bc_rope="none", bc_rope_theta=10.0,
+                 scan_paths=(0, 1, 2, 3), aux_tokens=False):
         super().__init__()
         # num_heads kept for signature parity with attention baseline; unused.
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
@@ -735,6 +827,7 @@ class JiTBlock(nn.Module):
             in_context_layout=in_context_layout, ssm_norm=ssm_norm,
             feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
             a_tie=a_tie, bc_rope=bc_rope, bc_rope_theta=bc_rope_theta,
+            scan_paths=scan_paths, aux_tokens=aux_tokens,
         )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -918,8 +1011,63 @@ class JiTVMamba(nn.Module):
         #                and no in-context tokens, state-init or SSC
         bc_rope: str = "none",
         bc_rope_theta: float = 10.0,
+        # ── Scan paths (a structural modifier; not in n_arms) ──
+        #   (0, 1, 2, 3) → SS2D's four paths, byte-for-byte the baseline
+        #   (0, 2)       → the two FORWARD paths only, row-major and column-major,
+        #                  both from cell (0, 0) to (H-1, W-1); needs K = 2 and,
+        #                  untested otherwise, every arm / modifier off
+        scan_paths=(0, 1, 2, 3),
+        # ── SF-Mamba auxiliary patch swapping (a modifier; not in n_arms) ──
+        #   "none"   → off, byte-for-byte
+        #   "swap"   → at block aux_tokens_start two tokens, the mean of the grid
+        #              tokens, join as [head, tail, grid]; head scanned before
+        #              cell (0, 0), tail after the last cell in both forward
+        #              paths; head <-> tail swapped after every block but the
+        #              last; stripped before the final layer
+        #   "noswap" → the same tokens, never swapped (control)
+        #   Needs scan_paths (0, 2) and every arm / modifier off.
+        aux_tokens: str = "none",
+        aux_tokens_start: int = 0,
     ):
         super().__init__()
+        scan_paths = tuple(int(p) for p in scan_paths)
+        assert scan_paths in SCAN_PATHS, (
+            "scan_paths=%r is not supported (use %s)"
+            % (list(scan_paths), " | ".join(str(list(p)) for p in SCAN_PATHS)))
+        assert K == len(scan_paths), (
+            "K=%d must equal len(scan_paths)=%d; set K: %d with scan_paths %r"
+            % (K, len(scan_paths), len(scan_paths), list(scan_paths)))
+        assert aux_tokens in AUX_TOKEN_MODES, (
+            "Unknown aux_tokens=%r (use %s)" % (aux_tokens, " | ".join(AUX_TOKEN_MODES)))
+        if isinstance(adaln_cond, bool):          # install_noadaln.sh configs
+            adaln_cond = "full" if adaln_cond else "none"
+        if scan_paths != (0, 1, 2, 3) or aux_tokens != "none":
+            what = ("aux_tokens=%r" % aux_tokens if aux_tokens != "none"
+                    else "scan_paths=%r" % list(scan_paths))
+            for bad, name in ((in_context_len > 0, "in_context_len > 0"),
+                              (state_init != "none", "state_init"),
+                              (ssc != "none", "ssc"),
+                              (adaln_cond != "full", "adaln_cond != full"),
+                              (bool(ssc_z_mlp), "ssc_z_mlp"),
+                              (ssm_norm != "none", "ssm_norm"),
+                              (feature_rope != "none", "feature_rope"),
+                              (a_tie != "none", "a_tie"),
+                              (bc_rope != "none", "bc_rope"),
+                              (ffn != "swiglu", "ffn != swiglu"),
+                              (norm != "rmsnorm", "norm != rmsnorm")):
+                assert not bad, (
+                    "%s is only defined (and tested) with every other arm and "
+                    "modifier off; got %s" % (what, name))
+        if aux_tokens != "none":
+            assert scan_paths == (0, 2), (
+                "aux_tokens=%r needs scan_paths [0, 2] (forward-only scans; the "
+                "4-path SS2D already scans every cell in reverse)" % (aux_tokens,))
+            assert 0 <= aux_tokens_start < depth, (
+                "aux_tokens_start=%d must index a block (depth %d)"
+                % (aux_tokens_start, depth))
+        self.scan_paths = scan_paths
+        self.aux_tokens = aux_tokens
+        self.aux_tokens_start = aux_tokens_start
         validate_feature_rope(feature_rope, feature_rope_theta, int(expand * hidden_size))
         validate_bc_rope(bc_rope, bc_rope_theta, d_state)
         assert bc_rope == "none" or (
@@ -1066,6 +1214,7 @@ class JiTVMamba(nn.Module):
                 adaln_cond=adaln_cond, ffn=ffn, ssm_norm=ssm_norm,
                 feature_rope=feature_rope, feature_rope_theta=feature_rope_theta,
                 a_tie=a_tie, bc_rope=bc_rope, bc_rope_theta=bc_rope_theta,
+                scan_paths=scan_paths, aux_tokens=aux_tokens != "none",
             )
             for i in range(depth)
         ])
@@ -1214,11 +1363,21 @@ class JiTVMamba(nn.Module):
             if self.in_context_len > 0 and i == self.in_context_start:
                 ctx = self._build_prefix(t_emb, y_emb)
                 x = torch.cat([ctx, x], dim=1)         # (B, in_context_len + L, D)
+            # SF-Mamba aux tokens: [head, tail] = mean of the grid tokens, once.
+            if self.aux_tokens != "none" and i == self.aux_tokens_start:
+                m = x.mean(dim=1, keepdim=True)
+                x = torch.cat([m, m, x], dim=1)        # (B, 2 + L, D)
             x = block(x, c, H, W, c_ssc=c_ssc)
+            # Swap head and tail after every block but the last (out of place).
+            if (self.aux_tokens == "swap"
+                    and self.aux_tokens_start <= i < len(self.blocks) - 1):
+                x = torch.cat([x[:, 1:2], x[:, 0:1], x[:, 2:]], dim=1)
 
         # Strip the prefix once, after the final block.
         if self.in_context_len > 0:
             x = x[:, self.in_context_len:, :]
+        if self.aux_tokens != "none":
+            x = x[:, 2:, :]
 
         x = self.final_layer(x, c)
         return self.unpatchify(x)

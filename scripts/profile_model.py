@@ -79,6 +79,7 @@ def build_model(cfg):
             a_tie=m.get("a_tie", "none"),
             bc_rope=m.get("bc_rope", "none"),
             bc_rope_theta=m.get("bc_rope_theta", 10.0),
+            scan_paths=tuple(m.get("scan_paths", [0, 1, 2, 3])),
         )
     raise ValueError(f"Unknown model: {arch}")
 

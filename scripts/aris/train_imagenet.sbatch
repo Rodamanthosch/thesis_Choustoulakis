@@ -12,7 +12,9 @@
 # Environment (from submit_imagenet.sh):
 #   MODEL     jit | vim | vmamba | vmamba-incontext1 | spatial | spatial-nogate |
 #             spatial-nogate-b16 | spatial-nogate-incontext10 |
-#             spatial-nogate-b16-incontext10 | vmamba2 | sasf       (required)
+#             spatial-nogate-b16-incontext10 | spatial-nogate-b16-incontext32 |
+#             spatial-nogate-b16-incontext17 |
+#             vmamba2 | sasf                                       (required)
 #   EPOCHS    total epochs of the run                              (default 100)
 #   ACCUM     training.accum_iter; global batch stays 1024         (default: the config's)
 #   JIM_ROOT  folder made by scripts/icarus/setup_env.sh           (default ARIS work dir)
@@ -25,7 +27,7 @@
 #SBATCH --exclusive
 set -euo pipefail
 
-MODEL=${MODEL:?set MODEL (jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|spatial-nogate-b16|spatial-nogate-incontext10|spatial-nogate-b16-incontext10|vmamba2|sasf)}
+MODEL=${MODEL:?set MODEL (jit|vim|vmamba|vmamba-incontext1|spatial|spatial-nogate|spatial-nogate-b16|spatial-nogate-incontext10|spatial-nogate-b16-incontext10|spatial-nogate-b16-incontext32|spatial-nogate-b16-incontext17|vmamba2|sasf)}
 EPOCHS=${EPOCHS:-100}
 ACCUM=${ACCUM:-}
 JIM_ROOT=${JIM_ROOT:-/gpfs/work/pr019/nspanos/jim}
@@ -44,6 +46,8 @@ case "$MODEL" in
   spatial-nogate-b16) CONFIG=configs/imagenet/jit-b16-spatial-nogate-imagenet.yaml ;;
   spatial-nogate-incontext10) CONFIG=configs/imagenet/jit-s2-spatial-nogate-incontext-class10-imagenet.yaml ;;
   spatial-nogate-b16-incontext10) CONFIG=configs/imagenet/jit-b16-spatial-nogate-incontext-class10-imagenet.yaml ;;
+  spatial-nogate-b16-incontext32) CONFIG=configs/imagenet/jit-b16-spatial-nogate-incontext-class32-imagenet.yaml ;;
+  spatial-nogate-b16-incontext17) CONFIG=configs/imagenet/jit-b16-spatial-nogate-incontext-class17-imagenet.yaml ;;
   vmamba2) CONFIG=configs/imagenet/jit-s2-vmamba2-imagenet.yaml ;;
   sasf)    CONFIG=configs/imagenet/jit-s2-vmamba-sasf-imagenet.yaml ;;
   *) echo "FATAL: unknown MODEL=$MODEL"; exit 1 ;;

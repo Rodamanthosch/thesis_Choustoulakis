@@ -2,7 +2,7 @@
 # =============================================================================
 # setup_env.sh -- build the JiT / JiM environment on Icarus, entirely inside ONE folder.
 #
-#   bash setup_env.sh                    # default root: /nfs/scratch/prod-2026-17/n.spanos/jim
+#   bash setup_env.sh                    # default root: /nfs/scratch/alloc-pr-2026-10-17/n.spanos/jim
 #   JIM_ROOT=/some/other/dir bash setup_env.sh
 #
 # Run on the LOGIN node (needs internet). Safe to re-run: every step skips what is done.
@@ -21,7 +21,7 @@
 # =============================================================================
 set -euo pipefail
 
-JIM_ROOT=${JIM_ROOT:-/nfs/scratch/prod-2026-17/n.spanos/jim}
+JIM_ROOT=${JIM_ROOT:-/nfs/scratch/alloc-pr-2026-10-17/n.spanos/jim}
 REPO_URL=https://github.com/Rodamanthosch/thesis_Choustoulakis.git
 PY_VERSION=3.12               # the mamba-ssm / causal-conv1d wheels below are cp312
 

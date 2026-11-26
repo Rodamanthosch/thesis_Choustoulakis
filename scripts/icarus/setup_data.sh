@@ -27,7 +27,7 @@
 # =============================================================================
 set -euo pipefail
 
-JIM_ROOT=${JIM_ROOT:-/nfs/scratch/prod-2026-17/n.spanos/jim}
+JIM_ROOT=${JIM_ROOT:-/nfs/scratch/alloc-pr-2026-10-17/n.spanos/jim}
 [ -f "$JIM_ROOT/env.sh" ] || { echo "FATAL: $JIM_ROOT/env.sh missing -- run setup_env.sh first"; exit 1; }
 source "$JIM_ROOT/env.sh" >/dev/null
 python -c "import torchvision, scipy" || { echo "FATAL: venv incomplete -- re-run setup_env.sh"; exit 1; }

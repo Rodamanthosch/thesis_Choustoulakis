@@ -184,38 +184,38 @@ def build_model(cfg):
             norm=m.get("norm", "rmsnorm"),
             derf_alpha_init=m.get("derf_alpha_init", 0.5),
         )
-    elif arch == "vmamba_global":
-        from src.models.vmamba_global import JiTVMambaGlobal
-        return JiTVMambaGlobal(
+    elif arch == "spatial_global":
+        from src.models.spatial_global import JiTSpatialGlobal
+        return JiTSpatialGlobal(
             input_size=m["input_size"], patch_size=m["patch_size"],
             in_channels=m["in_channels"], hidden_size=m["hidden_size"],
             depth=m["depth"], num_heads=m["num_heads"], mlp_ratio=m["mlp_ratio"],
             attn_drop=m["attn_drop"], proj_drop=m["proj_drop"],
             num_classes=m["num_classes"], bottleneck_dim=m["bottleneck_dim"],
-            d_state=m.get("d_state", 16), d_conv=m.get("d_conv", 3),
-            expand=m.get("expand", 1), K=m.get("K", 4),
-            global_len=m.get("global_len", 16),
-            global_start=m.get("global_start", 4),
-            global_readback=m.get("global_readback", True),
-            global_kernel_xe=m.get("global_kernel_xe", "linear"),
+            d_state=m.get("d_state", 1), d_conv=m.get("d_conv", 3),
+            expand=m.get("expand", 1), gate=m.get("gate", True),
+            sasf_dilations=tuple(m.get("sasf_dilations", (1, 3, 5))),
+            lpu=m.get("lpu", "none"),
+            grad_checkpoint=m.get("grad_checkpoint", False),
             ffn=m.get("ffn", "swiglu"),
             norm=m.get("norm", "rmsnorm"),
             derf_alpha_init=m.get("derf_alpha_init", 0.5),
-            # vmamba.py arms: passed only so JiTVMambaGlobal can assert them off
+            global_len=m.get("global_len", 16),
+            global_start=m.get("global_start", 4),
+            global_readback=m.get("global_readback", True),
+            # spatial_mamba options: passed only so JiTSpatialGlobal can assert them off
             in_context_len=m.get("in_context_len", 0),
-            in_context_layout=m.get("in_context_layout", "prefix"),
+            in_context_positions=m.get("in_context_positions", None),
             in_context_content=m.get("in_context_content", "class"),
-            state_init=m.get("state_init", "none"),
-            ssc=m.get("ssc", "none"),
-            adaln_cond=m.get("adaln_cond", "full"),
-            ssc_z_mlp=m.get("ssc_z_mlp", False),
+            aux_tokens=m.get("aux_tokens", "none"),
+            dwconv_can=m.get("dwconv_can", False),
+            sasf_can=m.get("sasf_can", False),
             ssm_norm=m.get("ssm_norm", "none"),
             feature_rope=m.get("feature_rope", "none"),
-            a_tie=m.get("a_tie", "none"),
-            bc_rope=m.get("bc_rope", "none"),
+            sasf_state_kernels=m.get("sasf_state_kernels", "shared"),
         )
     else:
-        raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba | spatial_mamba | vmamba2 | vmamba_sasf | vmamba_global")
+        raise ValueError(f"Unknown model: {arch}. Choose jit | vim | vmamba | spatial_mamba | vmamba2 | vmamba_sasf | spatial_global")
 
 
 # torch-fidelity scores every file with these extensions in the folder.

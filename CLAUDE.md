@@ -283,7 +283,7 @@ adaLN-Zero and the token-wise SwiGLU are unchanged. Per path and block: (dt_rank
 The tokens have 0 params, so the control and the swap / no-swap models load into each other strictly. The notebook `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-2path-auxswap.ipynb` resumes only from paths containing `2path-auxswap`; a control notebook needs a tag that is not a substring of it (e.g. `2path-plain`).
 
 `tests/test_vmamba_2path_auxswap_cpu.py` proves:
-- the defaults are bit-identical to commit `fe955ad` (pinned; `SCAN_PATHS_REFERENCE=<rev>` overrides) for 17 JiTVMamba arm / modifier builds, `vmamba_sasf` and `vmamba_global`;
+- the defaults are bit-identical to commit `fe955ad` (pinned; `SCAN_PATHS_REFERENCE=<rev>` overrides) for 17 JiTVMamba arm / modifier builds and `vmamba_sasf`;
 - the helpers against `cross_scan` / `cross_merge`;
 - the `[0, 2]` mixer, with and without tokens, against a naive float64 transcription on a rectangular grid;
 - causality on the mixer and on a whole `JiTBlock`;
@@ -520,100 +520,117 @@ the GPU check **and** hardware probe: it reports whether the Triton kernel runs
 on the GPU in bf16 / fp32 and prints which `force_fp32` to use. Triton
 officially targets Ampere+; run it on Kaggle T4 before training there.
 
-## JiT-S2-VMamba-Global (`model: vmamba_global`)
+## JiT-S2-Spatial-Global (`model: spatial_global`)
 
-`src/models/vmamba_global.py` is a **separate model** (`vmamba.py` untouched):
-JiT-S2-VMamba with JiT's persistent class tokens that **never enter the scan**.
-Image↔image mixing is the stock scan; every interaction with a token is linear,
-undecayed and order-free, through the block's own `x_proj[k]` / `dt_proj[k]`.
+`src/models/spatial_global.py` is a **separate model** (`spatial_mamba.py`
+untouched): the Spatial-Mamba no-gate scaffold (one row-major scan, SASF,
+d_state 1) with JiT's persistent class tokens that **never enter the scan**.
+Image↔image mixing is the stock scan + SASF; every interaction with a token is
+linear, undecayed and order-free, through the block's own `x_proj` / `dt_proj`.
+It replaces `vmamba_global` (commit 17e2793, removed; checkpoints of it need
+that commit to load).
 
-Per block and direction k, with `v = Δ ⊙ u` for both groups:
+Per block, with `v = Δ ⊙ u` for both groups:
 
-- `S_k = (1/M) Σ_m v^e_m B^e_mᵀ` and `G_k = (1/L) Σ_s v_s B_sᵀ`, each (B, d_inner, N),
+- `S = (1/M) Σ_m v^e_m B^e_m` and `G = (1/L) Σ_s v_s B_s`, each (B, d_inner, 1),
   computed in fp32 with autocast off;
-- image paths: `y_k = scan_k + α_xe ⊙ (S_k C_t)`, then `cross_merge`;
-- tokens: `y^e = Σ_k [(α_ee ⊙ S_k + α_ex ⊙ G_k) C^e + D_k ⊙ u^e]`;
-- then out_norm + out_proj on all rows, everything from the same block input.
+- image: the memory anchors the scan states **before SASF**,
+  `h = SASF(x + α_xe ⊙ S)`, then `y = C·h + D·u`;
+- tokens (not fused): `y^e = (α_ee ⊙ S + α_ex ⊙ G)·C^e + D·u^e`;
+- then out_norm [· SiLU(z)] + out_proj on all rows, everything from the same
+  block input.
 
 The kernel call is the baseline's, unchanged (L = 64 in every block). This is
-exact because of the anchored recurrence. Take a = α_xe and Ā = exp(ΔA)
-elementwise. Then `h_t = Ā h_{t−1} + (1 − Ā)(aS) + v_t B_tᵀ` with `h_0 = aS`
-gives `h_t − aS` = the stock state, so `y_t = scan_t + (aS) C_t`. That holds for
-Mamba-1's free A[d, n] (no tying); it does not hold for `softmax`.
+exact because of the anchored recurrence:
+- take a = α_xe and Ā = exp(ΔA) elementwise. Then
+  `x'_t = Ā x'_{t−1} + (1 − Ā)(aS) + v_t B_t` with `x'_0 = aS` gives
+  `x' = x + aS`, and SASF fuses that;
+- SASF is linear and pads by replication, so a spatially constant map comes
+  out as `κ ⊙ map`, with `κ_c = Σ_j α_j Σ taps_j[c]` (27 at the ones-init with
+  3 dilations);
+- so every cell reads `C_t κ ⊙ α_xe ⊙ S`, undecayed.
 
 | `model:` key | values | meaning |
 |---|---|---|
-| `global_len` | default 16 | M tokens; `0` builds `JiTVMamba`'s baseline exactly |
+| `global_len` | default 16 | M tokens; `0` builds `JiTSpatialMamba`'s baseline exactly |
 | `global_start` | default 4 | block the tokens join at, `[0, depth)` |
 | `global_readback` | `true` (default) \| `false` | `false` = write only: no G, no `alpha_ex`, tokens read S only |
-| `global_kernel_xe` | `linear` (default) \| `softmax` | image←token term `α_xe ⊙ Σ_m softmax_m(C_t·B^e_m/√N) v^e_m` (fp32, no 1/M); token rows stay linear |
+| `d_state`, `gate`, `sasf_dilations`, `lpu`, `grad_checkpoint`, `ffn`, `norm` | as `spatial_mamba` | `d_state` must be 1 |
 
 **Reused vs new.**
-- `JiTVMambaGlobal` subclasses `JiTVMamba(in_context_len=M, content "class",
-  layout "prefix")`, so slots (`incontext_pos_embed`, std 0.02), insertion,
-  persist & update, strip, adaLN / FFN for the tokens, conv-FFN centre tap and
-  `initialize_weights` are all reused.
-- It then swaps the mixers of blocks `start … depth−1` for `SS2DGlobal(SS2D)`
-  carrying the same weights. The swap runs under `fork_rng`, so the shared
-  weights and the RNG state after construction equal the prefix model's at the
-  same seed.
+- `JiTSpatialGlobal` subclasses `JiTSpatialMamba(in_context_len=M,
+  in_context_positions=None, content "class")`, so these are all reused:
+  - the slots (`incontext_pos_embed`, std 0.02);
+  - insertion, persist & update and the strip;
+  - adaLN / FFN for the tokens;
+  - the LPU and conv-FFN centre tap;
+  - `initialize_weights`.
+- It then swaps the mixers of blocks `start … depth−1` for
+  `SpatialGlobalSSM(StructureAwareSSM)` carrying the same weights. The swap runs
+  under `fork_rng`, so the shared weights and the RNG state after construction
+  equal the Spatial prefix model's at the same seed.
+- The scan's A, D and delta bias are taken in `promote_types(dtype, fp32)`:
+  identical to `.float()` for fp32 / bf16, exact in the float64 proofs.
 
-**Token features differ from the prefix arm:** in_proj → DWConv **centre tap +
-bias** → SiLU (Spatial-Mamba's `token_conv`). vmamba.py's prefix tokens skip both
-the conv and the SiLU, so global vs prefix differs in the token input as well as
-the mixing.
+**Token features differ from the in-context class tokens:** in_proj → DWConv
+**centre tap + bias** → SiLU (spatial_mamba's `token_conv`, used by the aux
+tokens). The class tokens get the raw in_proj output.
 
-**Gains.** `alpha_xe` / `alpha_ee` / `alpha_ex` are (d_inner,), ones-init, flat
-1-D (no decay). Blocks before `global_start` keep plain `SS2D` with no gains;
-an unused gain there (or write-only's `alpha_ex`) would have `.grad is None`,
-which crashes DDP (built without `find_unused_parameters`).
+**Gains.** `alpha_xe` / `alpha_ee` / `alpha_ex` are (d_inner,), ones-init and
+flat 1-D (no decay). Blocks before `global_start` keep plain `StructureAwareSSM`
+with no gains. An unused gain there (or write-only's `alpha_ex`) would have
+`.grad is None`, which crashes DDP (built without `find_unused_parameters`).
 
 The **last block** (`depth − 1`, `emit_tokens=False`) holds `alpha_xe` only:
-- its token rows are stripped right after it, so it skips G and the token read
-  (and S under `softmax`);
-- its token rows are just `Σ_k D_k u^e`;
+- its token rows are stripped right after it, so it computes no G and no token read;
+- its token rows are just `D u^e`;
 - `alpha_ee` / `alpha_ex` there would get an all-zero gradient through the strip
-  slice (dead weights, but no DDP error).
+  slice (dead weights, no DDP error).
 
 **Guards.**
-- Every vmamba.py arm key is accepted only to be asserted off:
-  `in_context_len/layout/content`, `state_init`, `ssc`, `adaln_cond` ≠ full,
-  `ssc_z_mlp`, `ssm_norm`, `feature_rope`, `a_tie`, `bc_rope`. `build_model`
-  passes them, so a config that sets one fails.
-- `ffn` (conv FFNs: tokens get the centre tap, as for the prefix) and
-  `norm: derf` (token-wise) are allowed but untested in training.
+- Every other spatial_mamba token / conditioning option is accepted only to be
+  asserted off: `in_context_len/positions/content`, `aux_tokens`, `dwconv_can`,
+  `sasf_can`, `ssm_norm`, `feature_rope`, `sasf_state_kernels` ≠ shared, and
+  `d_state` ≠ 1. `build_model` passes them, so a config that sets one fails.
+- There is no softmax mode: at d_state 1 its logits `C_t·B^e_m` are products of
+  two scalars.
+- `ffn` (conv FFNs), `norm: derf` and `gate: true` are allowed but untested in
+  training.
 
-| Tiny-IN config under `configs/tiny_imagenet/` | params | GMACs (estimate) |
+| Tiny-IN config under `configs/tiny_imagenet/` | params | ΔMACs over `jit-s2-spatial-nogate` (expected) |
 |---|---|---|
-| `jit-s2-vmamba-global-full` (M 16) | 31,046,208 | ≈ 1.657 |
-| `jit-s2-vmamba-global-writeonly` (M 16) | 31,043,520 | ≈ 1.646 |
-| `jit-s2-vmamba-global-softmax` (M 16, same shapes as full) | 31,046,208 | ≈ 1.657 |
-| `jit-s2-vmamba-global-full-m32` | 31,052,352 | ≈ 1.867 |
+| `jit-s2-spatial-nogate-global-full` (M 16) | 29,700,708 | +191,422,464 |
+| `jit-s2-spatial-nogate-global-writeonly` (M 16) | 29,698,020 | +191,250,432 |
+| `jit-s2-spatial-nogate-global-full-m32` | 29,706,852 | +382,672,896 |
 
-Params are baseline + M·384 (slots) + 384·(3 or 2)·7 (blocks 4–10) + 384 (block 11).
+Params are the no-gate 29,686,116 + M·384 (slots) + 384·(3 or 2)·7 (blocks 4–10)
++ 384 (block 11). The ΔMACs are the token rows' linears (they skip the scan and
+SASF) plus the S / G einsums; the anchor and the token read are elementwise.
+
 The notebooks
-(`notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-global-{full-m16,writeonly-m16,softmax-m16,full-m32}.ipynb`)
-resume only from paths containing that tag; full and softmax load into each other
-strictly.
+(`notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-global-{full-m16,writeonly-m16,full-m32}.ipynb`)
+resume only from paths containing that tag (`spatial-global-…`).
 
-`tests/test_vmamba_global_cpu.py` proves:
-- `global_len: 0` is bit-identical to `JiTVMamba`, and the no-token mixer is `SS2D`;
-- the shared init equals the prefix model's;
-- the mixer equals a naive float64 transcription of the four-block matrix
-  `[[α_ee/M C_eB_eᵀ, α_ex/L C_eB_xᵀ],[α_xe/M C_xB_eᵀ, K_xx]]` (all three modes,
-  with and without `emit_tokens`, rectangular grid);
-- the anchored recurrence;
+`tests/test_spatial_global_cpu.py` proves:
+- `global_len: 0` is bit-identical to `JiTSpatialMamba`, and the no-token mixer
+  is `StructureAwareSSM`;
+- the shared init equals the Spatial prefix model's;
+- the mixer equals a naive float64 transcription (explicit decay sums, + aS,
+  replicate-clamped SASF; both modes, `emit_tokens` and gate on / off,
+  rectangular grid);
+- the anchored recurrence, and SASF of a constant map = κ ⊙ map;
 - token-permutation equivariance, S / G order independence, D counted once;
 - bf16 with fp32 memories;
-- counts, no dead parameters, strict loading, guards, and both `build_model`s.
+- counts and no decay, no dead parameters, strict loading, guards, grad
+  checkpointing and both `build_model`s.
 
-`scripts/check_vmamba_global_cuda.py --config full|writeonly|softmax|full-m32`
-is the GPU check (kernel vs ref, bf16, it/s, peak memory and fvcore MACs vs the
-baseline and the m = 16 / 32 prefixes). `scripts/measure_vmamba_global.py` is
-the diagnostic, per block and direction over t and class:
-- `‖α_xe·read‖/‖scan‖`;
-- the effective rank of S_k;
-- `‖G‖/‖S‖`.
+`scripts/check_spatial_global_cuda.py --config full|writeonly|full-m32` is the
+GPU check: kernel vs ref, bf16, it/s, peak memory and fvcore ΔMACs (within 2 %)
+vs the no-gate and in-context class3 runs. `scripts/measure_spatial_global.py`
+is the diagnostic, per block over t and class:
+- `‖C·SASF(α_xe S)‖/‖C·SASF(x)‖`;
+- `‖G‖/‖S‖`, `‖S‖`;
+- the class and time fractions of the mean S.
 
 It uses training images, the only labelled split. `src/internals.py` /
 `scripts/measure_internals.py` are not ported: the model reports
@@ -628,11 +645,11 @@ model and prove it in a CPU test under `tests/` (see
 
 `build_model` is duplicated in `scripts/run_experiment.py` and
 `scripts/evaluate.py`. These have drifted apart before — **update both** whenever
-a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf`, `vmamba2` and `vmamba_global` alike), or evaluation
+a model flag is added (for `vmamba`, `spatial_mamba`, `vmamba_sasf`, `vmamba2` and `spatial_global` alike), or evaluation
 will silently build a different model than training did. `evaluate.py --can_zero`
 and `--can_freeze` (CAN eval ablations; `--can_freeze` is set inside the EMA swap)
 have no training counterpart. `scripts/profile_model.py` passes only `feature_rope`, `a_tie`, `bc_rope` and `scan_paths` through for vmamba (not `aux_tokens`) and no conditioning flags
-at all, and does not build `spatial_mamba` or `vmamba_global`; complexity numbers come from `evaluate.py::build_model` via
+at all, and does not build `spatial_mamba` or `spatial_global`; complexity numbers come from `evaluate.py::build_model` via
 `notebooks/tiny_imagenet/jit-s2-vmamba-tinyin-complexity.ipynb`.
 
 ## Tests

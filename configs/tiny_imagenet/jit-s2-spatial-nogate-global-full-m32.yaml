@@ -1,0 +1,83 @@
+# ============================================================
+# JiT-S2-Spatial-Global (model: spatial_global) on Tiny-ImageNet 64x64 -- full-m32
+# ------------------------------------------------------------
+# src/models/spatial_global.py: jit-s2-spatial-nogate.yaml (FID 93.95) plus
+# M = 32 class tokens (y_emb + learned slot), joined at block 4, carried
+# through blocks 4-11 and stripped before the final layer, as the in-context
+# tokens -- but NEVER inserted into the scan. Per block the tokens write a
+# memory S = mean_m (Delta u)^e B^e (one value per channel at d_state 1); it
+# anchors the image's scan states BEFORE SASF, h = SASF(x + alpha_xe * S), so
+# the image reads C_t * kappa * alpha_xe * S undecayed at every cell. The
+# tokens read alpha_ee * S + alpha_ex * G, G = mean_s (Delta u)_s B_s.
+#   this file: full, M = 32 (JiT Table 9's token count)
+# Gains alpha_* (384,), ones-init, no decay; block 11 holds alpha_xe only (its
+# token rows are stripped right after it). Token features get the mixer
+# DWConv's centre tap + SiLU. Params 29,706,852; fvcore +382.67M MACs over the
+# no-gate baseline (estimate). Every other spatial_mamba token / CAN option
+# stays off (asserted by JiTSpatialGlobal).
+# ============================================================
+
+experiment:
+  name: jit-s2-spatial-tinyin-nogate-global-full-m32
+  model: spatial_global
+  dataset: imagenet
+  data_dir: ./data/tiny-imagenet-200
+  seed: 42
+
+model:
+  input_size: 64
+  patch_size: 8
+  in_channels: 3
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0                    # FFN width: h = int(mlp_ratio * D * 2/3) = 1024
+  bottleneck_dim: 128
+  num_classes: 200
+  attn_drop: 0.0
+  proj_drop: 0.0
+  d_state: 1                        # Spatial-Mamba (and VMamba-T) setting; required
+  d_conv: 3
+  expand: 1                         # param-matched to VMamba-T (paper uses 2)
+  gate: false                       # true: LN(y)*SiLU(z) (paper Fig. 4) | false: no z branch
+  sasf_dilations: [1, 2, 3]         # SASF on the 8x8 grid; paper [1, 3, 5] for 16x16 (256px)
+  lpu: zero                         # Local Perception Units before mixer & FFN: none | zero | paper
+  # -- global condition tokens (spatial_global) --
+  global_len: 32                    # M class tokens
+  global_start: 4                   # tokens join at block 4 (blocks 0-3 pure grid)
+  global_readback: true             # true: tokens also read the image memory G
+  # -- FFN variant (orthogonal to the arms) --
+  ffn: swiglu                  # swiglu | convglu | glumbconv
+
+training:
+  epochs: 100
+  batch_size: 128
+  warmup_epochs: 5
+  blr: 5.0e-5
+  optimizer: adamw
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+  amp: true
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  t_eps: 0.05
+  noise_scale: 1.0
+
+cfg:
+  label_drop_prob: 0.1
+  cfg_scale: 2.5
+  cfg_interval: [0.1, 1.0]
+
+sampling:
+  method: heun
+  steps: 50
+
+checkpoint:
+  save_last_freq: 5
+  save_archive_freq: 25
+  resume_from: null
+  output_dir: experiments/tiny_imagenet/jit-s2-spatial-nogate-global-full-m32

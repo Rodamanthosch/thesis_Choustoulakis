@@ -12,8 +12,8 @@ in float64 when fed float64).
 Checks:
   A. defaults (scan_paths [0,1,2,3], aux_tokens none) are BIT-IDENTICAL to
      commit fe955ad (pinned; SCAN_PATHS_REFERENCE=<rev> overrides): init and
-     perturbed output of JiTVMamba under every arm / modifier, JiTVMambaSASF
-     and JiTVMambaGlobal built on the reference vmamba.py.
+     perturbed output of JiTVMamba under every arm / modifier, and
+     JiTVMambaSASF built on the reference vmamba.py.
   B. cross_scan_paths / cross_merge_paths: (0, 2) == cross_scan's paths 0 and 2
      and == cross_merge with paths 1 / 3 zeroed, bit for bit; the round trip is
      2x; with the four paths both are cross_scan / cross_merge exactly.
@@ -101,7 +101,6 @@ from src.models.vmamba import (                              # noqa: E402  (afte
     JiTVMamba, JiTBlock, SS2D, cross_scan, cross_merge, cross_scan_paths,
     cross_merge_paths)
 from src.models.vmamba_sasf import JiTVMambaSASF             # noqa: E402
-from src.models.vmamba_global import JiTVMambaGlobal         # noqa: E402
 
 REFERENCE = os.environ.get("SCAN_PATHS_REFERENCE", "fe955ad")
 KW = dict(input_size=16, patch_size=4, hidden_size=32, depth=4, num_classes=7,
@@ -221,12 +220,7 @@ else:
     ref_sasf = ref_module("src/models/vmamba_sasf.py", "ref_vmamba_sasf", over)
     same_as_ref(ref_sasf.JiTVMambaSASF, JiTVMambaSASF,
                 dict(d_state=1, sasf_dilations=(1, 2)), "JiTVMambaSASF")
-    ref_glob = ref_module("src/models/vmamba_global.py", "ref_vmamba_global", over)
-    for mode in ("linear", "softmax"):
-        same_as_ref(ref_glob.JiTVMambaGlobal, JiTVMambaGlobal,
-                    dict(VM, global_len=2, global_start=1, global_kernel_xe=mode),
-                    f"JiTVMambaGlobal {mode}")
-    n_checked += 3
+    n_checked += 1
     print(f"A  scan_paths / aux_tokens defaults bit-identical to {REFERENCE} for "
           f"{n_checked} model/arm builds (init + perturbed output, max|diff| = 0)")
 

@@ -41,8 +41,8 @@ Checks:
       identical (== 0), token rows the D term only, no G.
   I.  strict loading: write-only <- full and global <- Spatial prefix fail.
   J.  guards: every forbidden flag and bad value raises.
-  K.  wiring: both build_models build IDENTICAL models from the three
-      configs, and both reject a spatial_mamba option under spatial_global.
+  K.  wiring: both build_models build IDENTICAL models from the two
+      configs (M = 8), and both reject a spatial_mamba option under spatial_global.
   L.  every block is the identity at init (adaLN-Zero, LPU zero), both modes.
   M.  ffn convglu / glumbconv, norm derf and gate on: forward + backward
       finite; grad_checkpoint: bit-identical output and grads.
@@ -485,7 +485,7 @@ for kw in bad:
     raise AssertionError(f"guard missing for {kw}")
 print(f"J  guards: {len(bad)} forbidden flags / bad values raise")
 
-# ═══ K. both build_model copies agree on the three configs ══════════════════
+# ═══ K. both build_model copies agree on the two configs ════════════════════
 try:
     import yaml                                             # noqa: E402
 except ImportError as e:                                    # pragma: no cover
@@ -503,7 +503,7 @@ def load_build_model(rel):
     return ns["build_model"]
 
 
-TINY_IN = {"full": 29_700_708, "writeonly": 29_698_020, "full-m32": 29_706_852}
+TINY_IN = {"full": 29_697_636, "writeonly": 29_694_948}
 if yaml is not None:
     bm_train = load_build_model("scripts/run_experiment.py")
     bm_eval = load_build_model("scripts/evaluate.py")

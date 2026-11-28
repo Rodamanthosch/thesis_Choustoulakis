@@ -552,7 +552,7 @@ exact because of the anchored recurrence:
 
 | `model:` key | values | meaning |
 |---|---|---|
-| `global_len` | default 16 | M tokens; `0` builds `JiTSpatialMamba`'s baseline exactly |
+| `global_len` | default 8 | M tokens; `0` builds `JiTSpatialMamba`'s baseline exactly |
 | `global_start` | default 4 | block the tokens join at, `[0, depth)` |
 | `global_readback` | `true` (default) \| `false` | `false` = write only: no G, no `alpha_ex`, tokens read S only |
 | `d_state`, `gate`, `sasf_dilations`, `lpu`, `grad_checkpoint`, `ffn`, `norm` | as `spatial_mamba` | `d_state` must be 1 |
@@ -599,16 +599,15 @@ The **last block** (`depth − 1`, `emit_tokens=False`) holds `alpha_xe` only:
 
 | Tiny-IN config under `configs/tiny_imagenet/` | params | ΔMACs over `jit-s2-spatial-nogate` (expected) |
 |---|---|---|
-| `jit-s2-spatial-nogate-global-full` (M 16) | 29,700,708 | +191,422,464 |
-| `jit-s2-spatial-nogate-global-writeonly` (M 16) | 29,698,020 | +191,250,432 |
-| `jit-s2-spatial-nogate-global-full-m32` | 29,706,852 | +382,672,896 |
+| `jit-s2-spatial-nogate-global-full` (M 8) | 29,697,636 | +95,797,248 |
+| `jit-s2-spatial-nogate-global-writeonly` (M 8) | 29,694,948 | +95,625,216 |
 
 Params are the no-gate 29,686,116 + M·384 (slots) + 384·(3 or 2)·7 (blocks 4–10)
 + 384 (block 11). The ΔMACs are the token rows' linears (they skip the scan and
 SASF) plus the S / G einsums; the anchor and the token read are elementwise.
 
 The notebooks
-(`notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-global-{full-m16,writeonly-m16,full-m32}.ipynb`)
+(`notebooks/tiny_imagenet/jit-s2-spatial-tinyin-nogate-global-{full-m8,writeonly-m8}.ipynb`)
 resume only from paths containing that tag (`spatial-global-…`).
 
 `tests/test_spatial_global_cpu.py` proves:
@@ -624,7 +623,7 @@ resume only from paths containing that tag (`spatial-global-…`).
 - counts and no decay, no dead parameters, strict loading, guards, grad
   checkpointing and both `build_model`s.
 
-`scripts/check_spatial_global_cuda.py --config full|writeonly|full-m32` is the
+`scripts/check_spatial_global_cuda.py --config full|writeonly` is the
 GPU check: kernel vs ref, bf16, it/s, peak memory and fvcore ΔMACs (within 2 %)
 vs the no-gate and in-context class3 runs. `scripts/measure_spatial_global.py`
 is the diagnostic, per block over t and class:

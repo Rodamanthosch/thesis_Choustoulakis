@@ -131,7 +131,7 @@ A separate model (`src/models/spatial_global.py`) on the Spatial-Mamba no-gate b
 - **Memories.** Per block, the tokens write an undecayed memory `S = mean_m (Δu)ᵉ_m Bᵉ_m` (one value per channel), built with the block's own `x_proj` / `dt_proj`.
 - **What the image reads.** `S` anchors the image's scan states **before** SASF: `h = SASF(x + α ⊙ S)`. That is exactly the scan started from, and pulled towards, `α S`, so the CUDA kernel is unchanged. Because SASF pads by replication, every cell reads the memory undecayed.
 - **What the tokens read.** `S` and the image's own memory `G = mean_s (Δu)_s B_s`. `global_readback: false` drops `G`: the tokens write, but never read the image.
-- **Configs.** `jit-s2-spatial-nogate-global-{full,writeonly,full-m32}.yaml`; the scan stays at L = 64. (This replaces the earlier `vmamba_global` model on SS2D.)
+- **Configs.** `jit-s2-spatial-nogate-global-{full,writeonly}.yaml`, M = 8 tokens; the scan stays at L = 64. (This replaces the earlier `vmamba_global` model on SS2D.)
 
 ```bash
 python scripts/run_experiment.py --config configs/tiny_imagenet/jit-s2-spatial-nogate-global-full.yaml

@@ -16,13 +16,13 @@ added to the states before SASF.
      enter the scan); S / G / ve / anchor / token rows are fp32; the slots and
      every alpha_* get finite, non-zero gradients; the parameter count.
   3. Cost: train-step it/s and peak memory at batch 128, bf16, for the no-gate
-     baseline, the 3 in-context class tokens run and the three global configs.
+     baseline, the 3 in-context class tokens run and the two global configs.
   4. fvcore (src/flops_counter.count_complexity): params and MACs of the same
      list, against the expected deltas over the baseline.
 
 Run (on GPU, from the repo root):
     PYTHONPATH=. python scripts/check_spatial_global_cuda.py --config full
-    (--config writeonly | full-m32; --skip-cost to stop after 2)
+    (--config writeonly; --skip-cost to stop after 2)
 """
 import argparse
 import copy
@@ -42,7 +42,7 @@ from src.models.spatial_global import SpatialGlobalSSM
 from scripts.evaluate import build_model
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--config", default="full", choices=("full", "writeonly", "full-m32"))
+ap.add_argument("--config", default="full", choices=("full", "writeonly"))
 ap.add_argument("--skip-cost", action="store_true")
 args = ap.parse_args()
 
@@ -52,13 +52,13 @@ ok = True
 
 CFG_DIR = "configs/tiny_imagenet"
 GLOBAL = {n: f"{CFG_DIR}/jit-s2-spatial-nogate-global-{n}.yaml"
-          for n in ("full", "writeonly", "full-m32")}
+          for n in ("full", "writeonly")}
 BASE = f"{CFG_DIR}/jit-s2-spatial-nogate.yaml"
 INCONTEXT = f"{CFG_DIR}/jit-s2-spatial-nogate-incontext-class3.yaml"
-PARAMS = {"full": 29_700_708, "writeonly": 29_698_020, "full-m32": 29_706_852}
+PARAMS = {"full": 29_697_636, "writeonly": 29_694_948}
 # MACs over the baseline: the token rows' linears (no scan, no SASF) + the S
 # and G einsums (block 11: S only). The token read is elementwise (uncounted).
-EST_DMACS = {"full": 191_422_464, "writeonly": 191_250_432, "full-m32": 382_672_896}
+EST_DMACS = {"full": 95_797_248, "writeonly": 95_625_216}
 
 
 def set_scan(fn):

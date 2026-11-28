@@ -200,7 +200,7 @@ def build_model(cfg):
             ffn=m.get("ffn", "swiglu"),
             norm=m.get("norm", "rmsnorm"),
             derf_alpha_init=m.get("derf_alpha_init", 0.5),
-            global_len=m.get("global_len", 16),
+            global_len=m.get("global_len", 8),
             global_start=m.get("global_start", 4),
             global_readback=m.get("global_readback", True),
             # spatial_mamba options: passed only so JiTSpatialGlobal can assert them off

@@ -214,7 +214,7 @@ class JiTSpatialGlobal(JiTSpatialMamba):
         norm="rmsnorm",
         derf_alpha_init=0.5,
         # ── global condition tokens ──
-        global_len=16,                 # M; 0 = the JiTSpatialMamba baseline
+        global_len=8,                  # M; 0 = the JiTSpatialMamba baseline
         global_start=4,                # block the tokens join at
         global_readback=True,          # False = "write only": no G, no alpha_ex
         # ── spatial_mamba options: accepted ONLY to be asserted off ──
